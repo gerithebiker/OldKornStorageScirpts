@@ -1,0 +1,115 @@
+#!/bin/ksh
+#
+#
+#
+#This module contains procedures for the SnapmirrorCheck script
+#
+#Author: Geri
+#
+#Created: 2014/05/08
+#
+#Version 0.1 (initial)
+#
+#Procedures 
+#	LagCheck: Compares the scheduled lag and the current lag. Using global variables only
+#	SetSchedMis: Sets the SchedMis variable depending on the schedule of the volume
+
+FixIssues ()
+{
+	if [ "$debug" == "yes" ]; then
+		echo "FixIssues: $volume: $status: $transfer:"
+	fi
+}
+
+LagCheck ()
+{
+	#Calculate the lag in unix format
+	LagInUnix=`echo $lag | awk -F: '{print $1 "hours" $2 "minutes" $3 "seconds"}'`
+	LagInUnix=`$GNUdate -d "1970-01-01 00:00:00 UTC + $LagInUnix" +%s`
+
+	if [ "$debug" == "yes" ]; then
+		echo "\nLagCheckStart on $volume"
+	fi
+	#First we calculate the scheduled snapmirroring frequency from the actual time and the snapmirror schedule
+	#twice that freq gives the max lag time that is acceptable
+
+	#in the next "if" we check how the schedule is? more then once in an hour or only few times a day
+	#if few times a day, we need to check how the current lag should be
+	if [[ "$S_Hour" != '*' ]];then
+		#this is the "several times a day" part
+		#the schedule is smthing like: 0,4,8,12 usually starting at 0
+		#but becuse it can start other than 0, we need to check between the previous day last sched and today first sched
+		#this why we set "LastSync" to start from last day, which is part of the checking loop
+		FirstSync=`echo $S_Hour | awk -F, '{print $1}'`
+		#Calculate FirstSync in seconds
+		FirstSync=`echo "$FirstSync*3600"|bc`
+		
+		LastSync=`echo $S_Hour | awk -F, '{print $NF}'`
+		LastSync=`echo "$Zero_Hour-(86400-$LastSync*3600)"|bc`
+		#for similar reasons we add the next day's first sync time to the 
+		temp_hour=`echo $S_Hour | awk -F, '{print $1}'`
+		temp_hour=`echo "24+$temp_hour"|bc`
+		S_Hour="$S_Hour,$temp_hour"
+		
+		if [ "$debug" == "yes" ]; then
+			echo "S_Hour: $S_Hour"
+		fi
+		#echo $S_Hour
+		
+		for hour in `echo $S_Hour | sed 's/,/ /g'`;do
+			#CurrentSync must be in sec
+			CurrentSync=`echo "$Zero_Hour+$hour*3600"|bc`
+			if [[ $LastSync -lt $Actual_Date && $CurrentSync -gt $Actual_Date ]];then
+				#Threshold must be 2x the scheduled lag
+				Threshold=`echo "($CurrentSync-$LastSync)"|bc`
+				if [ "$debug" == "yes" ]; then
+					echo "Curr: $CurrentSync Last: $LastSync Threshold: $Threshold"
+				fi
+			fi
+			LastSync=$CurrentSync
+		done
+	else
+		echo $S_Min | awk -F, '{print NF}' | read NumberOfFields
+		if [ $NumberOfFields -eq 1 ]; then
+			Threshold=3600
+		else
+			echo $S_Min | awk -F, '{print $1, $2}' | read FirstSync SecondSync
+			Threshold=`echo "($SecondSync-$FirstSync)*60"|bc` #Syncs are in minutes, Threshold must be in seconds
+			if [ "$debug" == "yes" ]; then
+				echo "First: $FirstSync, Sec: $SecondSync, Thresh: $Threshold"
+			fi
+		fi
+	fi
+	Threshold=`echo "$Threshold*2"|bc` #Threshold must be 2x the scheduled 
+	#now we can compare the lag and the max lag
+	if [[ $Threshold -lt $LagInUnix ]];then
+		if [ "$transfer" != "" ];then
+			 #if the mirror is transferring, then we make the output a bit more readable
+			 #transfer looks like: (11 GB done)
+			 transfer=`echo $transfer | sed -e 's!(!, !' -e 's!)!!'`
+		fi
+		if [ "$status" == "Pending" ];then
+			echo "$filer:$volume is lagging by $lag instead of `/usr/local/bin/date -d @$Threshold +%H:%M:%S -u`, status is $status$transfer" 
+			# calling the test plugin
+			/santeam/ntap/lib/SnapmirrorReplicationFix $filer:$volume &
+			FixIssues
+		#else
+		# 	echo "$filer:$volume is lagging by $lag instead of `/usr/local/bin/date -d @$Threshold +%H:%M:%S -u`, status is $status$transfer"
+		fi
+	 fi
+	 if [ "$debug" == "yes" ]; then
+		 echo "$Threshold, $LagInUnix \nLagCheckEnd"
+	 fi
+}
+
+SetSchedMis ()
+{	
+	case $SCHED in
+		"Incorrect entry")
+			SchedMis=", the number of fields for the $volume is wrong, pls check";;
+		"")
+			SchedMis=", schedule is missing";;
+		*)
+			SchedMis=""
+	esac
+}

@@ -1,0 +1,249 @@
+#!/bin/ksh
+#
+#
+#This script is to generate the decommission commands 
+#Not official script, only for Geri
+#
+#
+
+#######################################################
+#                Preparation Steps                    #
+#######################################################
+
+#this is the directory, where the script is, so we use the modules from the exact same dir
+BASE_DIR="/santeam/ntap"
+Modules="$BASE_DIR/lib/Snapmirror_Module $BASE_DIR/lib/StandardNTAP_Module"
+WORKDIR="/santeam/Decom"
+
+MAIL_REC="sanadmin@citco.com" #
+MAIL_SENDER="..."
+
+myname="DecomLUN" #Place here the script name, you u can use it
+version="0.01"
+myfullname=$0 #Contains the full path where the script is running from
+
+#MyFiles
+fCheck="1_check"
+fReset="2_reset"
+fUnmap="3_unmap"
+fRename="4_renameLUNs"
+fOfflineLUN="5_offlineLUNs"
+fDestroyLUN="6_destroyLUNs"
+fEmptyvol="7_emptyvolcheck"
+fOfflineVol="8_offlineVolume"
+fDestroy="9_offlinedestroy"
+fRenameBACK="R_renameback"
+fRmapBACK="R_mapback"
+fROnlineBACK="R_onlineback"
+Steps_DONE="__Steps_DONE__"
+
+MyFiles="$fCheck $fReset $fUnmap $fRename $fOfflineLUN $fEmptyvol $fOfflineVol $fDestroy $fRenameBACK $fRmapBACK $fDestroyLUN $fROnlineBACK"
+
+for module in $Modules;do
+    if [ -s $module ]; then
+        . $module
+	else
+		echo "The module library $module doesn't exist..."
+		echo "Exiting..."
+		exit 11
+	fi
+done
+ColorInit
+
+Usage ()
+{
+ #echo "I was invoked as: ${BOLD}$myfullname"
+ echo
+ echo "Synopsis:"
+ echo "${NORM}   This script is to generate decomission scripts for LUNs${NORM}"
+ echo "   ${BOLD}Version: $version$NORM"
+ echo "   First you should create a folder in $WORKDIR folder, in a format of COXXXXXX_YYYY-MM-DD.\n   (Unix file system don't keep track when the folder was created, so it helps identify when the first steps were done)\n"
+ echo "   Put the LUNs into a file called \"$YELLOW_F${BOLD}data$NORM\", in the following format:"
+ echo "   ${BOLD}filer /vol/lunpath igroup$NORM, for example:"
+ echo "   ${BOLD}gen0sanfiler01 /vol/gen0vmmsapp203_old/qt_gen0vmmsapp203/gen0vmmsapp203.lun gen0_ent05_fcp${NORM}\n"
+ echo "   If the LUN is mapped to multiple igroups, separate the igroups with a \",\":"
+ echo "   gen0sanfiler01 /vol/gtest/qt_gtest/gtest02.lun $YELLOW_F${BOLD}gtest,gtest2$NORM\n"
+ echo "   If a LUN is not mapped, indicate that:"
+ echo "   brn0sanfiler05 /vol/gen0vmmsapp203_old/qt_gen0vmmsapp203/gen0vmmsapp203.lun $YELLOW_F${BOLD}NOT_Mapped${NORM}\n"
+ echo "   Once this is done, just run the script, it will generate all the commands, and place them into numbered scripts, and makes them executable"
+ echo "   When you want to do the actual decomission, run them one after the other. Of course you should do verification after the steps"
+ echo "   After each script finished, they will update a file called \"${BOLD}$Steps_DONE$NORM\", so later you can easily check what was done last time"
+ echo "   After the last step done, a new file called \"${BOLD}__DONE__${NORM}\" will be created for the same reason, containing the actual date."
+ echo "   Once all good, change dir to one level higher and move the folder to __DONE__/ in $WORKDIR"
+ echo
+ echo "Usage:"
+ echo "   ${BOLD}$myname${NORM}"
+ echo
+ echo 
+ echo "${BOLD}Examples:${NORM}"
+ echo "   ${BOLD}${BLUE_F}$myname${NORM}\n"
+ echo "   Don't forget to change directory where the \"data\" file is!"
+}
+
+#check the first parameter or no parameter
+if [[ "$1" == "?" || "$1" == "-h" || "$1" == "-?" || "$1" == "-help" ]]
+then
+	echo "\nHelp was requested..."
+	Usage
+	echo "Exiting..."
+	exit 1
+fi
+
+
+#######################################################
+#                 Parameter Handling                  #
+#######################################################
+#Parameter handling starts here, we will check all the parameters one-by-one
+
+#######################################################
+#                 Parameter Handling                  #
+#######################################################
+#while getopts a:bc: opt
+#do
+#    case $opt in
+#        a) VAR1=$OPTARG;;
+#        b) VAR2="yes";;
+#        c) VAR3=$OPTARG;;
+#		*) Usage;exit 1;;
+#	esac
+#done
+
+
+#origfolder=`pwd`
+#echo $origfolder
+CONum=`pwd | awk -F/ '{print $4}' | awk -F_ '{print $1}'`
+COFolder=`pwd`
+
+#checking the CO number format
+if [[ `echo ${#CONum}` != 8 || "`echo $CONum | sed 's/......$//'`" != "CO"  ]];then
+	if [[ "`echo $CONum | sed 's/\(.\)\(..*\)/\1/'`" != "R" ]];then
+		echo "The folder name does not comply with the standards"
+		Usage
+		echo "Exiting..."
+		exit 12
+	fi
+fi
+
+#######################################################
+#                     Procedures                      #
+#######################################################
+
+
+
+#######################################################
+#                     Main Script                     #
+#######################################################
+
+#Generate data file from 0_data if exist and check for data file
+if [ -e 0_data ];then
+	rm -f $COFolder/data $COFolder/data_tmp 2>/dev/null
+	LUNs=`cat 0_data`
+	cd /santeam/ConfigDB/OfflineLunDB
+	for lun in $LUNs;do
+		ggrep -i $lun * | sed -e 's/full_//' -e 's/ ..*g (..*)//' -e 's/=..*$//' -e 's/:/ /' | tee -a $COFolder/data_tmp
+	done
+	sort -u $COFolder/data_tmp > $COFolder/data
+fi
+cd $COFolder
+
+if [ ! -e ./data ]; then
+	echo "\nThe \"$YELLOW_F${BOLD}data$NORM\" file does NOT exist"
+	Usage
+	echo "Exiting..."
+	exit 2
+fi
+
+
+echo "Generating check script: $fCheck"
+awk '{print "ssh " $1 " lun stats " $2}' ./data > $fCheck
+echo 'echo "Step \"'$fCheck'\" has ran on `date`" >> '$Steps_DONE >> $fCheck
+
+echo "Generating reset script: $fReset"
+awk '{print "ssh " $1 " lun stats -z " $2}' ./data > $fReset
+echo 'echo "Step \"'$fReset'\" has ran on `date`" >> '$Steps_DONE >> $fReset
+
+echo "Generating unmap script: $fUnmap"
+#what is not mapped, don't need to be unmapped...
+> $fUnmap
+> $fRmapBACK
+
+ggrep -v NOT_Mapped ./data > data-temp
+cat ./data-temp | while myline=`line`;do
+	echo $myline | read filer lun Igroups
+	for igroup in `echo $Igroups | sed 's/,/ /g'`;do
+		echo "ssh $filer lun unmap $lun $igroup"  >> $fUnmap
+		echo "ssh $filer lun map $lun $igroup"  >> $fRmapBACK
+	done
+done
+echo 'echo "Step \"'$fUnmap'\" has ran on `date`" >> '$Steps_DONE >> $fUnmap
+rm -f data-temp data_temp 2>/dev/null
+
+echo "Generating rename script: $fRename"
+gawk -v co=$CONum '{print "ssh " $1 " lun move " $2, $2 "." co "_DELETE"}' ./data > $fRename
+echo 'echo "Step \"'$fRename'\" has ran on `date`" >> '$Steps_DONE >> $fRename
+
+echo "Generating offline commends: $fOfflineLUN"
+gawk -v co=$CONum '{print "ssh " $1 " lun offline " $2 "." co "_DELETE"}' ./data > $fOfflineLUN
+echo 'echo "Step \"'$fOfflineLUN'\" has ran on `date`" >> '$Steps_DONE >> $fOfflineLUN
+
+echo "Generating destroy LUN commands: $fDestroyLUN"
+gawk -v co=$CONum '{print "ssh " $1 " lun destroy " $2 "." co "_DELETE"}' ./data > $fDestroyLUN
+
+echo "Generating rename back file: $fRenameBACK"
+gawk -v co=$CONum '{print "ssh " $1 " lun move " $2 "." co "_DELETE " $2}' ./data > $fRenameBACK
+
+echo "Generating online back file: $fROnlineBACK"
+gawk -v co=$CONum '{print "ssh " $1 " lun online " $2}' ./data > $fROnlineBACK
+
+echo "Generating \"offline vol\" and \"destroy vol\" commands: $fEmptyvol $fOfflineVol $fDestroy"
+echo "echo the output of this script must be empty to be safe to go fw with the deletion!!!" > $fEmptyvol-temp
+> $fOfflineVol-temp
+> $fDestroy-temp
+> SnapMirror-temp
+> $fDestroy-tempclu
+
+FILERS=`awk '{print $1}' ./data | sort -u | tr '\n' ' '`
+
+echo "lunSearch -u $FILERS" | sed 's/0nc/0vmsan/' >> $fEmptyvol-temp
+
+cat ./data | while myline=`line`;do
+	vol=`echo $myline | awk -F/ '{print $3}'`
+	filer=`echo $myline | awk '{print $1}'`
+	echo "ssh $filer snapmirror update $vol" | ggrep -vE "ssh atl0|ssh gen0" >> SnapMirror-temp
+	echo "lunSearch $vol -f $filer" | sed 's/0nc/0vmsan/' >> $fEmptyvol-temp
+	if [ "`echo $vol | sed 's/^.*\(.\{2\}\)$/\1/'`" != "gg" ];then
+		echo "ssh $filer vol offline $vol" >> $fOfflineVol-temp # we can offline the volume only if not goldengate!
+		if [ "$filer" == "mia0nc01" ];then
+			echo "ssh $filer snapmirror delete -destination-path mia0nc01://mia0vmsan01/$vol " >> $fDestroy-tempclu
+		fi
+		echo "ssh $filer vol destroy $vol -f" >> $fDestroy-temp
+	fi
+done
+
+sort -u SnapMirror-temp >> $fDestroyLUN 
+sort -u $fEmptyvol-temp > $fEmptyvol
+sort -u $fOfflineVol-temp > $fOfflineVol
+sort -u $fDestroy-tempclu > $fDestroy
+sort -u $fDestroy-temp >> $fDestroy
+
+#echo in the "logging" part
+echo "Logging part..."
+echo 'echo "Step \"'$fDestroyLUN'\" has ran on `date`" >> '$Steps_DONE >> $fDestroyLUN
+echo 'echo "Step \"'$fEmptyvol'\" has ran on `date`" >> '$Steps_DONE >> $fEmptyvol
+echo 'echo "Step \"'$fOfflineVol'\" has ran on `date`" >> '$Steps_DONE >> $fOfflineVol
+echo 'echo "Step \"'$fDestroy'\" has ran on `date`" >> '$Steps_DONE >> $fDestroy
+echo 'echo "All the steps has been copleted on `date`" > __DONE__' >> $fDestroy
+
+rm -f $fDestroy-temp $fOfflineVol-temp $fEmptyvol-temp SnapMirror-temp $fDestroy-tempclu data-temp data_tmp 2>/dev/null
+
+
+chmod 770 $MyFiles
+
+echo "Successfully ran..."
+
+#cd $origfolder
+
+#######################################################
+#              Report sending, cleanup                #
+#######################################################
+

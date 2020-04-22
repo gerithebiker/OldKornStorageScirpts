@@ -1,0 +1,29 @@
+#!/bin/ksh
+#
+#
+#This script searches collects the aggregate names in the plant for the storage request form
+#
+#version 0.1 
+#author: Geri
+#change list
+#
+#
+LOGFILE=/santeam/ConfigDB/aggregateList
+#FILERS=`GetCtrlrList | grep -v clustered | awk -F: {'print $1}' | sed 's/,/ /' | sort`
+. /opt/CITCOSan/Drivers/Driver_init
+
+FILERS=`for filer in $FILERS;do echo $filer;done|sort`
+
+if [ -e $LOGFILE ]; then
+	rm $LOGFILE
+	printf "Old ConfigDB file $LOGFILE has been removed"
+else
+	printf "The file $LOGFILE doesn't exist, nothing to delete"
+fi
+echo ", new file is being created."
+
+for filer in $FILERS;do
+	Aggregates=`ssh $filer aggr status | grep online | grep -v aggr0 | awk '{print $1}' | tr '\n' ' '`
+	echo "$filer $Aggregates" | tee -a $LOGFILE
+done
+

@@ -1,0 +1,156 @@
+#!/bin/ksh
+#
+#
+#This script is to generate the decommission commands 
+#Not official script, only for Geri
+#
+#
+
+#######################################################
+#                Preparation Steps                    #
+#######################################################
+
+#this is the directory, where the script is, so we use the modules from the exact same dir
+BASE_DIR="/santeam/ntap"
+Modules="$BASE_DIR/lib/Snapmirror_Module $BASE_DIR/lib/StandardNTAP_Module"
+WORKDIR="/santeam/Decom"
+
+MAIL_REC="sanadmin@citco.com" #
+MAIL_SENDER="..."
+
+myname="DecomLUN" #Place here the script name, you u can use it
+version="0.1"
+myfullname=$0 #Contains the full path where the script is running from
+
+#MyFiles
+GeneratedCommands="CommandsToRun"
+Steps_DONE="__Steps_DONE__"
+
+MyFiles=""
+
+for module in $Modules;do
+    if [ -s $module ]; then
+        . $module
+	else
+		echo "The module library $module doesn't exist..."
+		echo "Exiting..."
+		exit 11
+	fi
+done
+ColorInit
+
+Usage ()
+{
+ #echo "I was invoked as: ${BOLD}$myfullname"
+ echo
+ echo "Synopsis:"
+ echo "${NORM}   This script is to generate re-mapping scripts for LUNs${NORM}"
+ echo "   ${BOLD}Version: $version$NORM"
+ echo "   First you should create a folder in $WORKDIR folder, in a format of COXXXXXX_YYYY-MM-DD.\n   (Unix file system don't keep track when the folder was created, so it helps identify when the first steps were done)\n"
+ echo "   Put the LUNs into a file called \"$YELLOW_F${BOLD}data$NORM\", in the following format:"
+ echo "   ${BOLD}filer /vol/lunpath from-igroup to-igroup$NORM, for example:"
+ echo "   ${BOLD}mia0sanfiler06 /vol/mia0vmsuapp24a/qt_mia0vmsuapp24a/mia0vmsuapp24a.lun mia0sgz08a mia0sgz32af${NORM}\n"
+ echo "   If the LUN is mapped to multiple igroups, you need to place them in separate lines:"
+ echo "   mia0sanfiler06 /vol/mia0vmsuapp24a/qt_mia0vmsuapp24a/mia0vmsuapp24a.lun mia0sgz08a mia0sgz32a"
+ echo "   mia0sanfiler06 /vol/mia0vmsuapp24a/qt_mia0vmsuapp24a/mia0vmsuapp24a.lun mia0sgz08b mia0sgz32b\n"
+ echo "   Once this is done, just run the script, it will generate all the commands, and place them into numbered scripts, and makes them executable"
+ echo "   When you want to do the actual work, run the generated script."
+ echo "   After each script finished, they will update a file called \"${BOLD}$Steps_DONE$NORM\", so later you can easily check what was done last time"
+ echo "   After the last step done, a new file called \"${BOLD}__DONE__${NORM}\" will be created for the same reason, containing the actual date."
+ echo "   Once all good, change dir to one level higher and move the folder to __DONE__/ in $WORKDIR"
+ echo
+ echo "Usage:"
+ echo "   ${BOLD}$myname${NORM}"
+ echo
+ echo 
+ echo "${BOLD}Examples:${NORM}"
+ echo "   ${BOLD}${BLUE_F}$myname${NORM}\n"
+ echo "   Don't forget to change directory where the \"data\" file is!"
+}
+
+#check the first parameter or no parameter
+if [[ "$1" == "?" || "$1" == "-h" || "$1" == "-?" || "$1" == "-help" ]]
+then
+	echo "\nHelp was requested..."
+	Usage
+	echo "Exiting..."
+	exit 1
+fi
+
+
+#######################################################
+#                 Parameter Handling                  #
+#######################################################
+#Parameter handling starts here, we will check all the parameters one-by-one
+
+#######################################################
+#                 Parameter Handling                  #
+#######################################################
+#while getopts a:bc: opt
+#do
+#    case $opt in
+#        a) VAR1=$OPTARG;;
+#        b) VAR2="yes";;
+#        c) VAR3=$OPTARG;;
+#		*) Usage;exit 1;;
+#	esac
+#done
+
+
+origfolder=`pwd`
+#echo $origfolder
+CONum=`pwd | awk -F/ '{print $4}' | awk -F_ '{print $1}'`
+
+
+#checking the CO number format
+if [[ `echo ${#CONum}` != 8 || "`echo $CONum | sed 's/......$//'`" != "CO"  ]];then
+	if [[ "`echo $CONum | sed 's/\(.\)\(..*\)/\1/'`" != "R" ]];then
+		echo "The folder name does not comply with the standards"
+		Usage
+		echo "Exiting..."
+		exit 12
+	fi
+fi
+
+CONum="${CONum}_`date -u +%H%M`"
+
+#######################################################
+#                     Procedures                      #
+#######################################################
+
+
+#######################################################
+#                     Main Script                     #
+#######################################################
+
+if [ ! -e ./data ]; then
+	echo "\nThe \"$YELLOW_F${BOLD}data$NORM\" file does NOT exist"
+	Usage
+	echo "Exiting..."
+	exit 2
+fi
+
+echo "Generating script"
+awk '{print "ssh " $1 " lun unmap " $2, $3}' ./data > $GeneratedCommands
+echo 'echo "Step unmap has ran"'  >> $GeneratedCommands
+echo 'echo "Step unmap has ran on `date`" >> '$Steps_DONE >> $GeneratedCommands
+
+echo "Generating snapshot commands"
+> $GeneratedCommands-temp
+while read -r filer lun fromIgroup toIgroup;do
+	vol=`echo $lun | awk -F/ '{print $3}'`
+	echo "ssh $filer snap create -V $vol $CONum" >> $GeneratedCommands-temp
+done < ./data
+sort -u $GeneratedCommands-temp >> $GeneratedCommands
+echo 'echo "Snapshots were taken"'  >> $GeneratedCommands
+echo 'echo "Snapshots were taken at `date`" >> '$Steps_DONE >> $GeneratedCommands
+
+echo "Generating remap commands"
+awk '{print "ssh " $1 " lun map " $2, $4}' ./data >> $GeneratedCommands
+echo 'echo "Step map has ran"'  >> $GeneratedCommands
+echo 'echo "Step map has ran on `date`" >> '$Steps_DONE >> $GeneratedCommands
+
+chmod 774 $GeneratedCommands
+rm -f $GeneratedCommands-temp 2>/dev/null
+echo "Command generation has been done"
+

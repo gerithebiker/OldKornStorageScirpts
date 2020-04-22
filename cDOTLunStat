@@ -1,0 +1,91 @@
+#!/bin/ksh
+#
+#
+#Author: Geri
+#Initial version
+#The script is temporary, we found a bug in "lun stats" in clustered systems, we can use this till it is fixed
+#2014. 02. 20.
+
+#Variables
+myname="CluLunStat"
+verion="0.1"
+
+if [ -e /etc/release ];then
+	BOLD="\\033[1m"
+	NORM="\\033[0m"
+	YELLOW_F="\\033[33m"; YELLOW_B="\033[43m"
+	RED_F="\\033[31m"
+	MAGENTA_F="\\033[35m"
+	CYAN_F="\\033[36m"
+	BLUE_F="\\033[34m"
+else
+	BOLD=$'\e[1m'
+	NORM=$'\e[0m'
+	YELLOW_F=$'\e[33m'; YELLOW_B=$'\e[43m'
+    RED_F=$'\e[31m'
+	MAGENTA_F=$'\e[35m'
+	CYAN_F=$'\e[36m'
+	BLUE_F=$'\e[34m'
+fi
+
+Usage()
+{
+	echo  
+	echo "${BOLD}Synopsis:$NORM"
+	echo "This script collects lun stats from the clusters."
+	echo "The script handles 2 parameters, first is clustername (mia0nc01/atl0nc01) second is the lun name."
+	echo
+}
+
+#if helpl was requested
+if [[ "$1" == "?" || "$1" == "-h" || "$1" == "-?" || "$1" == "-help" || "$#" == 0 ]];then
+	echo "Help was requested or no arguments."
+    Usage
+    exit
+fi
+
+#check the # of arguments
+if [ $# -lt 2 ];then
+	echo "Wrong number of arguments!"
+	Usage
+	exit
+fi
+
+if [ $# = 3 ];then
+	Collect_Time=$3
+else
+	Collect_Time=5
+fi
+#it works only on the clusters, so checking the names
+cluster=$1
+if [[ "$cluster" != "mia0nc01" && "$cluster" != "atl0nc01" ]];then
+	echo "You entered $cluster"
+	echo "Cluster name must be: $BOLD${MAGENTA_F}mia0nc01$NORM or $BOLD${MAGENTA_F}atl0nc01$NORM."
+	Usage
+	exit
+fi
+
+#Now the real fun. We need to have the volume name, the UUID of the LUN and which node/dg is it on
+#As it is cluster PLEASE don't forget that freakin' dos2unix pipe!!!
+echo "${BOLD}Collecting uuid, nodename...$NORM"
+lun=$2
+vol=`echo $lun | awk -F/ '{print $3}'`
+uuid=`ssh $cluster lun show $lun -fields uuid | dos2unix 2>/dev/null | grep $lun | awk '{print $3}'`
+if [ "$uuid" == "" ];then
+	echo "The lun $BOLD$YELLOW_F$lun$NORM does not exist on $BOLD$YELLOW_F$cluster.$NORM"
+	echo "Exiting..."
+	exit
+fi
+
+filer=`ssh $cluster vol show $vol -fields aggregate | dos2unix 2>/dev/null | grep $vol | awk -F_ '{print $NF}'`
+
+#echo "Debug: vol=$vol, uuid=$uuid, filer=$filer."
+#Once we have that info, we can start stats running, wait 5 sec, then grep the result
+echo "${YELLOW_F}Starting stats...$NORM"
+ssh $cluster run -node $filer "stats start"
+echo "Waiting $Collect_Time sec..."
+sleep $Collect_Time
+echo "$YELLOW_F${BOLD}The result:$NORM"
+ssh $cluster run -node $filer "stats stop" | grep $uuid | sed 's/^lun:'$uuid'://' | egrep "latency|ops|data|instance_name" | sed -e 's!'$uuid'!'$lun'!' -e 's/:/	/'
+
+

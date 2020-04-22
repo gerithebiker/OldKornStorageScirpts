@@ -1,0 +1,680 @@
+#!/bin/ksh
+#
+#This script generates command for creating a new lun on an already existing volume
+#it is for a "LUN expansion"
+#
+#
+#Written by Geri, 04/19/2012
+#Version 1.0
+#Version 1.2 updated the output, vol name was missing at the autosize command. 06/18/2012
+#Version 1.3 added the Recur routine to check names. Any LUN in the sequence could be given to the 
+#			 script, it will find the first free incremented by 1
+#			 For example if /vol/mia0sudb08_condr01data/qt_mia0sudb08_condr01data/mia0sudb08_condr01data7.lun is the last, then the
+# 			 generated command will give ...data8.lun
+#			 If there is no number in the end, then 02 will be added
+#			 01/15/2013
+#
+#Version 1.4 added switch -eles and created routines to execute the changes
+#			 also added to check the source volume's fs_size_fixed check
+#
+#Version 1.45 corrected the part that determines the snapmirror
+#
+#Version 2.0 2014/01/02
+#			 Clustered OnTap commands are added
+#			 LUN extend switch added
+#
+#Version 2.1 2014/08/06
+#			 Bug fixes
+#			 - To query the vol size originally I used "aggr show_space -g", because it sets the measurement unit. It gives the used space, 
+#			   so in case the vol is thin provisioned, it will give a smaller number than the vol size is. (Usually we don't use thin provisioning,
+#			   but we seen thin provisioned volumes.) Changed the vol size check to df -Vg, and sum it with awk.
+#			 - It can happen that the snapmirrir relationship still exist in Prod, but not in DR, I implemented an error checking for that
+#
+#Version 2.1.1 2014/09/18
+#			Added an "if" to avoid cluster name verification in the runtime if "-eles" switch is passed.
+#			  (if the script is called many times against the cluster, then it is very annoying, that is why the removal)
+#
+#Version 2.1.2 2014/11/17
+#			Modified the -to switch, "," can be used as a devider
+#
+#Version 2.5 2014/12/1-
+#
+#
+
+BASE_DIR=/santeam/ntap
+#For development
+#BASE_DIR=~/git/ntap
+
+Modules="$BASE_DIR/lib/Snapmirror_Module $BASE_DIR/lib/StandardNTAP_Module"
+
+for module in $Modules;do
+    if [ -s $module ]; then
+    	. $module
+    else
+		echo "The module library $module doesn't exist..."
+		echo "Exiting..."
+		exit 11
+    fi
+done
+
+ColorInit
+
+VERSION="2.2"
+MyName=AddNewLun
+WORKDIR=/santeam/tmp
+fTMP=AddNewLun_TMP
+ORIGDIR=`pwd`
+SysAdmin=`whoami`
+MAILTO="$SysAdmin@citco.com" #"sanadmin@citco.com"
+myERRLOG=AddNewLun_Error.log
+noMirrorLUN=AddNewLun_NML.log
+RESULTFILE=ExtendIn_$1
+REMOVEFILES="$RESULTFILE $fTMP $myERRLOG $noMirrorLUN"
+cd $WORKDIR
+
+##########################################
+#Procedures
+##########################################
+Usage ()
+{
+	#Usage is the "man" page, only output
+	echo
+ 	echo "${BOLD}Synopsis:$NORM"
+	echo "   This script is to create a new LUN in an existing volume, incrementing the ending of the existing LUN"
+	echo "   A full lun name is something like this:"
+	echo "          $BOLD/vol/atl0sudb11_quorum/qt_atl0sudb11_quorum/atl0sudb11_quorum.lun$NORM"
+	echo "   The script first verifies if the lun exist on the given filer. If not it gives an error message"
+	echo "   If the LUN exist, then verifies if the lun ...atl0sudb11_quorum${MAGENTA_F}02${NORM}.lun or ...atl0sudb11_quorum${MAGENTA_F}2${NORM}.lun exist"
+	echo "   If any of those LUN exist, then it tries to find the first free number."
+	echo "   Once it found the free name it will generate the commands to create the new LUN and prints them on the screen"
+	echo "   It also checks for the existing mirrored (DR) LUN, and generates the command to map the new mirrored LUN also"
+	echo "   It is able to run the commands on the filers, it could be specified, or if it is not specified it will ask if you want to run them"
+	echo "   You can also specify the CO number and a recipient, so after the new LUN created a notification mail will be sent out"
+	echo 
+	echo "${BOLD}Version: $VERSION${NORM}"
+	echo 
+	echo "${BOLD}Usage:"
+	echo "   $MyName Filer existing_LUN NewLunSize [-to address] [-co number] [-eles] [-ext]${NORM}"
+	echo
+	echo "   ${BOLD}Filer${NORM}         where the existing LUN is, could be on any filer, but usually Atlanta of Geneva"
+	echo "   ${BOLD}existing_LUN${NORM}  the full path of the existing LUN, like /vol/test/qt_test/test.lun"
+	echo "   ${BOLD}NewLunSize${NORM}    in GB"
+	echo "   ${BOLD}-to address${NORM}   Optional, it could be one or more addresses separated by space or comma, but only the user name,"
+   	echo "	            like: ${BOLD}-to koconnell glaszlo${NORM}, or ${BOLD}-to koconnell,glaszlo${NORM}"
+	echo "   ${BOLD}-co number${NORM}    Specify the CO number"
+	echo "   ${BOLD}-eles${NORM}         If you specify this switch it will run the generated commands against the filer(s)"
+	echo "                    It doesn't work in ${BOLD}BETA$NORM versions. This version is ${BOLD}$VERSION$NORM"
+	echo "   ${BOLD}-ext${NORM}          Extends the given LUN instead of creating a new one"
+	echo 
+	echo "${BOLD}Examples:$NORM"
+	echo "   ${BOLD}${BLUE_F}$MyName atl0sanfiler01 /vol/atl0sudb11_quorum/qt_atl0sudb11_quorum/atl0sudb11_quorum.lun 15$NORM"
+	echo "          First it will search if ...atl0sudb11_quorum02.lun or ...atl0sudb11_quorum2.lun or subsequent LUN exist,"
+   	echo "          finds the first free name, and generates the commands. Also generates the commands for the DR site,"
+	echo "          that is mia0sanfiler01 this time, then asks if you want to run the actual commands. If yes,"
+	echo "          it will create the new LUN, maps it to the original igroup, and also waits for the snapmirror to be updated,"
+	echo "          then maps the mirrored LUN to the igroup in DR."
+	echo "   ${BOLD}${BLUE_F}$MyName atl0sanfiler01 /vol/atl0sudb11_quorum/qt_atl0sudb11_quorum/atl0sudb11_quorum.lun 15 -co 104351 -to koconnell xgomez glaszlo -eles${NORM}"
+	echo "          As the ${BOLD}-eles$NORM switch specified, it will run the commands agains the filers without any question,"
+	echo "          but will wait 5 seconds after the commands are generated, otherwise same thing as above,"
+	echo "          plus sends a mail to glaszlo@citco.com and sanadmin@citco.com after completion."
+}
+
+ErrorHandling ()
+{
+	#Any kind of error handling should be here
+	#Should be called with a parameter: what kind of checking
+	case $1 in
+		ssh_check)
+			if [ -s $myERRLOG ];then
+				echo "There was an issue connecting to filer $BOLD$FILER$NORM, the error message was:$BOLD"
+				cat $myERRLOG
+				echo "${NORM}Exiting...\n"
+				exit 6
+			fi
+			if [ -s $fTMP ];then
+				if [[ `cat $fTMP | egrep "is an invalid value for field"` != "" ]];then
+					echo "$BOLD$ORIGLUN$NORM is not a valid LUN name...\nExiting..."
+					exit 7
+				fi
+			else
+				echo "The LUN $BOLD$ORIGLUN$NORM does not exist on $BOLD$FILER$NORM"
+				echo "Exiting..."
+				exit 8
+			fi
+			;;
+	esac
+}
+
+
+Recur ()
+{
+	#this is a recursive routine to increment the ending of a lun if it is something like xxx1.lun
+	#if the lun name ends without a number, then the name changed to 02.lun
+	#otherwise incremented by 1, then checked if the incremented lun exist
+	recoun=$(( $recoun + 1 ))
+	checkDateLun=$newLunName.lun
+	if [[ $lunNO = +([0-9]) ]]; then
+		    lunNO=$(( $lunNO + 1 ))
+		    newLunName=`echo $newLunName|sed 's/\(.*\)\(.\{1\}\)$/\1/'`
+		    newLunName=$newLunName$lunNO".lun"
+#			test_a=`ssh $1 lun show $newLunName|awk -F/ '{print $2}'`
+			if [[ `ssh $FILER lun show $newLunName 2>&1 | dos2unix 2>/dev/null | grep vol |awk -F/ '{print $2}'` == "vol" ]]; then
+				echo "The lun ${YELLOW_F}${BOLD}$newLunName ${NORM}exist, I check if there is a free LUN name." 
+				newLunName=`echo $newLunName|sed 's/\.lun//'` #cut off .lun to restore the original format before the Recur routine
+				Recur $FILER $recoun #this is the recursive call, because the lun exist
+			else
+				if [ $recoun -gt 1 ]; then
+					echo "I found a free name: ${YELLOW_F}${BOLD}$newLunName ${NORM}"
+				fi
+			fi
+	else
+			if [[ `ssh $FILER lun show ${newLunName}02.lun 2>&1 | dos2unix 2>/dev/null | grep vol |awk -F/ '{print $2}'` == "vol" ]]; then
+				newLunName=`echo $newLunName`"02"
+				lunNO=2
+				Recur $FILER $recoun #this is the recursive call, because the lun exist
+			else
+				if [[ `ssh $FILER lun show ${newLunName}2.lun 2>&1 | dos2unix 2>/dev/null | grep vol |awk -F/ '{print $2}'` == "vol" ]]; then
+					newLunName=`echo $newLunName`"2"
+					lunNO=2
+					Recur $FILER $recoun #this is the recursive call, because the lun exist
+				else
+					newLunName=`echo $newLunName`"02.lun"
+					faszom=1
+		    		echo $MAGENTA_F"Cannot increment the lun name ending, so added 02!!!"$NORM
+				fi
+			fi
+	fi
+}
+
+
+Doit ()
+{
+	$COMMAND "vol size $vol $newVolSize"
+	if [ "$origautosize" == "" ]
+	    then
+        echo "${BOLD}Autosize setting is ${YELLOW_F}OFF${NORM}${BOLD} for volume ${YELLOW_F}$vol${NORM}."
+		echo "Here is the command to enable it:"
+	fi
+    echo "vol autosize $vol -m $autosize -i 5g on"
+	if [ "$Extend" != "yes" ];then
+		if [ $faszom -eq 1 ];then echo $MAGENTA_F;fi
+		$COMMAND "lun create -s $NEWLUNSIZE$lunsizeUnit -t $LUNtype $newLunName"
+		echo $NORM
+		$COMMAND "lun comment $newLunName \"$comment\""
+		for igroup in $igroups;do
+			$COMMAND "lun map $newLunName $igroup"
+		done
+	else
+		if [[ $fType == "seven" ]];then 
+			$COMMAND "lun resize $newLunName $ExtLUN_Size$lunsizeUnit"
+		else
+			$COMMAND "lun resize $newLunName -size $ExtLUN_Size$lunsizeUnit -force"
+		fi
+	fi
+	$COMMAND "lun show -v $newLunName"
+}
+
+WaitForSnapmirror ()
+{
+	if [ "$Extend" != "yes" ];then
+		LUNEXIST=`$COMMAND lun show -v $newLunName 2>&1 | egrep "no entries matching|No such LUN exists" | wc -l | sed 's/^  *//'` 
+		if [[ $LUNEXIST -eq 1 ]]
+		then
+			echo "Waiting for snapmirror to update..."
+			sleep 10 
+			WaitForSnapmirror
+		fi
+	fi
+}
+
+DrDoit ()
+{
+	#increase the vol size in DR
+	$COMMAND "vol size $vol $newVolSize"
+	if [[ $fType == "cluster" ]];then
+		SM_Command="show"
+	else
+		SM_Command="status"
+	fi
+	#if it is not an extension, but a new lun, we need to wait for the mirror to update and map the new lun
+	if [ "$Extend" != "yes" ];then
+		$COMMAND "snapmirror update $vol"
+		$COMMAND "snapmirror $SM_Command $vol"
+		#echo "lun show -v $2"
+		if [[ "$SM_UPDATE" == "yes" ]]
+		then
+			WaitForSnapmirror
+		fi
+		if [ ! -z $mirrorigroups ];then
+			for mirrorigroup in $mirrorigroups;do
+				$COMMAND "lun map $newLunName $mirrorigroup"
+			done
+		else
+			echo "The LUN $newLunName cannot be mapped as the original LUN $BOLD$ORIGLUN$NORM is not mapped..."
+		fi
+		$COMMAND "lun show -v $newLunName"
+	else
+		echo "The extended LUN will be grown once the snapmirror updated."
+	fi
+}
+
+
+##########################################
+#Main Script
+##########################################
+#Parameter Handling
+##########################################
+if [[ $# -lt 3 || "$1" == "?" || "$1" == "-h" || "$1" == "-?" || "$1" == "-help" ]]
+then
+        Usage
+		cd $ORIGDIR
+        exit 1
+fi
+
+FILER=$1;shift
+ORIGLUN=$1;shift
+NEWLUNSIZE=$1;shift
+
+#We shift through all the parameters
+#When it is a switch, we set a flag to controll the next parameter
+while [ ! -z "$1" ]; do
+    case "$1" in
+		-ext)	Extend="yes" ;;
+        -eles)  ELES=$1 
+				if [ "`echo $VERSION | grep -i beta`" != "" ];then
+					echo "The ${BOLD}-eles$NORM switch is not supported in beta versions. Exiting..."
+					exit 66
+				fi
+				;;
+        -to)    flag="to";;
+        -co)    flag="co";;
+        *)      case "$flag" in
+					to) 
+						RemovedDevider=`echo $1 | sed 's/[,]/ /g'`
+						for person in $RemovedDevider;do
+							MAILTO="$person@citco.com,$MAILTO"
+						done;;
+                    co) CO_NUM=$1 ;;
+                    *)  Usage $1 
+						cd $ORIGDIR
+						exit 1
+						;;
+                esac
+    esac
+    shift
+done
+
+#The naming convention is:
+#locx[sanfiler|vmsan]yy ->vmsan is virtual cluster name, but we can ssh only to the clustername
+#in case someone gives the vmsan, then ask for the cluster name
+if [ `echo $FILER | cut -c 5-9` == "vmsan" ];then
+	echo "\nYou provided the ${BOLD}virtual filer name$NORM, I cannot use it."
+	FILER=`echo $FILER | sed 's/vmsan/nc/'`
+	if [ "$ELES" != "-eles" ];then
+		printf "I try to change it to the cluster name, is this the right name? $BOLD$FILER$NORM? (y/n) "
+		USER_RESPONSE=`GetChar`
+		echo
+		case "$USER_RESPONSE" in
+			" y"|"y")	USER_RESPONSE=""
+				echo "All right, using cluster $BOLD$FILER$NORM"
+				;;
+			*)	echo "OK, you can provide the cluster name, just type it in and hit <enter>."
+				echo "If it is not in the correct format, I'll exit."
+				read USER_RESPONSE
+				if [[ "`echo $USER_RESPONSE | cut -c 5-6`" == "nc" ]];then
+					FILER=$USER_RESPONSE
+					USER_RESPONSE=""
+					echo "OK, I can use the name $BOLD$FILER$NORM also..."
+				else
+					echo "Eh, you making fun on me... Exiting..."
+					exit 5
+				fi
+				;;
+		esac
+	fi
+fi
+
+#Determine if the filer is 7mode or cluster
+fType=`echo $FILER | cut -c 5-6`
+if [[ "$fType" == "nc" ]];then
+    fType="cluster"
+else
+    fType="seven"
+fi
+echo "Working in $fType mode..."
+
+
+#Collect some info from the existing lun
+if [[ "$fType" == "cluster" ]];then
+	ssh $FILER set -units GB ';' lun show -v $ORIGLUN 2>$myERRLOG | dos2unix  2>/dev/null | egrep "Comment|LUN Size|OS Type|$ORIGLUN"  > $fTMP
+	ErrorHandling ssh_check
+	igroups=`ssh $FILER lun show -m $ORIGLUN | grep $ORIGLUN | awk '{print $3}'`
+else
+	ssh $FILER lun show -v $ORIGLUN 2>$myERRLOG | egrep "vol|Comment|Maps|Multiprotocol" > $fTMP
+	ErrorHandling ssh_check
+	igroups=`ssh $FILER lun show -m $ORIGLUN | sed 's!'$ORIGLUN'!!' | egrep -v "is not mapped." | awk '{print $1}'` 
+fi
+
+#(Multiprotocol/OS Type: solaris_efi)
+#if -ext is specified and the LUNtype is "solaris_efi", then we need to exit
+#as the solaris luns shouldn't be extended
+LUNtype=`cat $fTMP | egrep "Multi|OS Type" | awk '{print $3}'`
+if [[ "$LUNtype" == "solaris_efi" && "$Extend" == "yes" ]];then
+	echo "$BOLD${YELLOW_F}Solaris LUNs shouldn't be extended!$NORM\nExiting..."
+	exit 9
+fi
+
+echo igrps: $igroups
+
+if [ -z $igroups ];then
+	echo "The LUN $BOLD$ORIGLUN$NORM is not mapped on the filer $BOLD$FILER$NORM, looks like it is not in use, exiting..."
+	exit 4
+fi
+
+if [ "`cat $fTMP`" == "" ]
+then
+	echo "No ${MAGENTA_F}$ORIGLUN${NORM} lun on ${BOLD}$FILER${NORM} filer!"
+	cd $ORIGDIR
+	exit 2
+fi
+
+if [ "$Extend" != "yes" ];then
+	echo "Igroups for the LUN in PROD: \n$igroups"
+fi
+
+#set variables
+faszom=0 #this is a flag, if it is 0, then the lun name will be printed in magenta
+#existing volume's name (/vol/volname/qt_volname/volname.lun)
+vol=`cat $fTMP | grep vol | awk -F/ '{print $3}'` #same for 7 and clu modes
+
+#echo vol $vol
+#existing volume's size (vol size: Flexible volume 'volname' has size 54g.)
+echo "Checking volume size..."
+if [[ "$fType" == "cluster" ]];then
+	volsize=`ssh $FILER set -units g ';' vol show $vol | dos2unix  2>/dev/null | grep $vol | awk '{print $6}'`
+else
+	#in 7mode we need to use df, because you cannot set the measurement unit if u use "vol size"
+	volsize=`ssh $FILER df -Vg $vol | grep $vol | sed 's/GB//' | awk '{sum+=$2} END {print sum}'`
+	#we need to add back the Unit
+	volsize="${volsize}GB"
+fi
+
+#Check snapmirror settings
+echo "Determining snapmirror settings for $BOLD$vol$NORM..."
+if [[ $fType == "cluster" ]];then
+	mirrorfiler=`ssh $FILER snapmirror show | dos2unix 2>/dev/null | grep $vol | awk -F: '{print $2}' | awk '{print $NF}'`
+else
+	mirrorfiler=`ssh $FILER snapmirror status $vol | egrep $vol | awk '{print $2}' | awk -F: '{print $1}'`
+fi
+if [ -z $mirrorfiler ];then
+	echo "The lun $BOLD$ORIGLUN$NORM does not have snapmirror!"
+	NO_MIRROR="true"
+else
+	#checking the igroups only if new lun, not an extension
+	if [ "$Extend" != "yes" ];then
+		echo "Checking igroups in DR..."
+		if [[ $fType == "cluster" ]];then
+			mirrorigroups=`ssh $mirrorfiler lun show -m $ORIGLUN | dos2unix 2>/dev/null | egrep $ORIGLUN | awk '{print $3}'`
+		else
+			#we need to redirect the stderr of ssh to catch if the LUN doesn't exist in DR
+			mirrorigroups=`ssh $mirrorfiler lun show -m $ORIGLUN 2> $noMirrorLUN | sed 's!'$ORIGLUN'!!' | egrep -v "is not mapped." | awk '{print $1}'`
+		fi
+		if [ "`cat $noMirrorLUN`" == "lun show: No such LUN exists" ];then
+			echo "Error with ${BOLD}snapmirror!$NORM\nAlthough the snapmirror relationship ${BOLD}exist in Prod$NORM, the LUN does not exist in DR."
+			echo "Continuing without snapmirror..."
+			NO_MIRROR="true"
+		else
+			if [ -z $mirrorigroups ];then
+				echo "The LUN $BOLD$ORIGLUN$NORM is not mapped on $BOLD$mirrorfiler$NORM."
+			else
+				echo "The mirroring filer is: $mirrorfiler, the igroup name(s):\n$mirrorigroups"
+			fi
+		fi
+	fi
+fi
+
+#we need to check if the volume has fs_size_fixed on
+#it needs to be checked only in "source"
+echo "Checking volume \"file system fixed\" option..."
+if [[ $fType == "cluster" ]];then
+	#vserver and volume is not in use, but need to be read
+	ssh $FILER set -unit GB ';' vol show $vol -fields max-autosize,percent-snapshot-space,filesys-size-fixed | grep $vol | read vserver volume origautosize snaprsrv FS_SIZE_FIXED
+else
+	All_options=`ssh -n $FILER vol options $vol`
+	FS_SIZE_FIXED=`for option in $All_options
+	do
+		echo $option
+	done|grep fs_size_fixed `
+fi
+
+#if it is set to ON, then we change it to off
+if [[ "$FS_SIZE_FIXED" == "fs_size_fixed=on," || "$FS_SIZE_FIXED" == "true" ]];then
+	echo "\nThe option \"filesystem size\" set to fixed for the volume $BOLD$vol$NORM in filer $BOLD$FILER$NORM, the volume size cannot be changed."
+	echo "That setting must be updated, otherwise I cannot work..."
+	echo "Do you want me to set it to \"off\"? (y/n)"
+	USER_RESPONSE=`GetChar`
+	case "$USER_RESPONSE" in
+		" y"|"y")
+			if [[ $fType == "cluster" ]];then
+				ssh $FILER vol modify $vol -filesys-size-fixed false
+			else
+				ssh $FILER vol options $vol fs_size_fixed off
+			fi
+			echo "FS Fixed has been set \"off\""
+			;;
+		*)	
+			echo "Here is the command you need to run:"
+			if [[ $fType == "cluster" ]];then
+				echo "ssh $FILER vol modify $vol -filesys-size-fixed false"
+			else
+				echo "ssh $FILER vol options $vol fs_size_fixed off"
+			fi
+			echo "Let me know when you have done it..."
+			exit 3
+	esac		
+fi
+
+#few more variables
+#find the comment of the old LUN ( Comment: "CFS\AEX - Aexeo - DEV Sybase data" )
+comment=`cat $fTMP | grep Comment | awk -F: '{print $2}' | sed -e 's/"//g' -e 's/^ //'`
+
+#last caracter of volsize
+volSizeUnit=`echo $volsize | sed 's/^.*\(..\{1\}\)$/\1/' | sed 's/.$//' | tr [:upper:] [:lower:]`
+
+#cut off the last character that is the size unit
+volsize=`echo $volsize | sed 's/..$//'`
+
+#cut off .lun from the end, and then create new ending
+newLunName=`echo $ORIGLUN | awk -F. '{print $1}'`
+
+#newLunName=$newLunName"_extend"$3".lun"
+lunNO=`echo $newLunName | sed 's/^.*\(.\{1\}\)$/\1/'`
+
+if [[ $fType == "cluster" ]];then
+	lunsize=`cat $fTMP | grep Size | awk '{print $3}' | sed 's/..$//'`
+	lunsizeUnit=`cat $fTMP | grep Size | awk '{print $3}' | sed -e 's/^.*\(..\{1\}\)$/\1/' -e 's/.$//' | tr [:upper:] [:lower:]`
+	snaprsrv=`echo $snaprsrv | sed 's/%//'`
+	asUnit=`echo $origautosize | sed -e 's/^.*\(..\{1\}\)$/\1/' -e 's/.$//' | tr [:upper:] [:lower:]` 
+	origautosize=`echo $origautosize | sed 's/..$//'`
+else
+	#/vol/jrc1vmsudbdev01_sybdata/qt_jrc1vmsudbdev01_sybdata/jrc1vmsudbdev01_sybdata.lun   40.0g (42953867264)   (r/w, online, mapped)
+	#original: lunsize=`cat $fTMP | grep vol | awk '{print $2}' | sed 's/[gtm]$//' | awk '{FS = "."}{print $1}'`
+	lunsize=`cat $fTMP | grep vol  | awk '{print $3}' | sed -e 's/(//' -e 's/)//'`
+	lunsize=$(echo "scale=0;$lunsize/1073741824"|bc)
+	#lunsizeUnit=`cat $fTMP | grep vol | awk '{print $2}' | sed 's/^.*\(.\{1\}\)$/\1/'`
+	lunsizeUnit="g"
+	#find out snapreserve.
+	snaprsrv=`ssh $FILER snap reserve $vol|awk '{print $7}' | sed 's/.$//'`
+	#the original autosize setting on the volume. if not set, the variable
+	#origautosize will be ""
+	ssh $FILER vol autosize $vol | awk '{print $11, $12}' | grep , | read origautosize asUnit
+	asUnit=`echo $asUnit | sed 's/..$//' | tr [:upper:] [:lower:]`
+fi
+
+#echo "- $lunsize - $igroups - $snaprsrv - $asUnit - $origautosize"
+
+#if it is not a lun extension, but a new numbered lun,
+#then we need to check the lun name avialability
+if [ "$Extend" != "yes" ]; then
+	Recur $FILER
+	LUNAge=`CheckLunCreationTime $FILER $checkDateLun $fType`
+	if [ $LUNAge -lt 86400 ];then
+		echo "\nLooks like the original LUN $BOLD$YELLOW_F$ORIGLUN$NORM was extended in the last 24 hours with the LUN $BOLD$checkDateLun$NORM"
+		printf "Do you want to proceed?? (y/n) "
+		USER_RESPONSE=`GetChar`
+		echo
+		if [ "$USER_RESPONSE" != " y" ];then
+			echo "Exiting..."
+			exit 12
+		fi
+	fi
+else
+	echo "No recur call as it is an extension..."
+	newLunName=$ORIGLUN
+fi
+
+
+#calculate new vol size, bc is to handle floating point numbers
+#newVolSize=$(echo "scale=1;$volsize+$NEWLUNSIZE+($volsize+$NEWLUNSIZE+$snaprsrv*($volsize+$NEWLUNSIZE))*0.1"|bc)
+
+#only for tshooting
+#echo NewLun=$NEWLUNSIZE SnapRSV=$snaprsrv OrigVolSize=$volsize
+
+newVolSize=$(echo "scale=3;$volsize+($NEWLUNSIZE+($snaprsrv/100*$NEWLUNSIZE)/0.9+1)"|bc)
+newVolSize=`echo $newVolSize|awk -F. '{print $1}'`
+((Increment=newVolSize-volsize))
+
+echo "Checking available space on containing aggregate..."
+isEnoughSpace=`CheckSpaceOnAggregate $FILER $vol $Increment $fType`
+if [ "$isEnoughSpace" == "N" ];then
+	echo "\n${BOLD}There is not enough space on the containing aggregate in filer $FILER, exiting...$NORM"
+	exit 15
+fi
+
+if [ ! -z $mirrorfiler ];then
+	echo "Checking available space on containing aggregate on the mirroring filer..."
+	isEnoughSpaceMirror=`CheckSpaceOnAggregate $mirrorfiler $vol $Increment $fType`
+	if [ "$isEnoughSpaceMirror" == "N" ];then
+		echo "\n${BOLD}There is not enough space on the containing aggregate in the mirroring filer $mirrorfiler, exiting...$NORM"
+		exit 15
+	fi
+fi
+
+#I used the following 3 lines for troubleshooting
+#echo \*\*\*\*\*\*\*\*\*
+#echo $newVolSize
+#echo \*\*\*\*\*\*\*\*\*
+
+autosize=$(echo "scale=1;$newVolSize*1.5+1"|bc)
+autosize=`echo $autosize|awk -F. '{print $1}'`
+newVolSize=$newVolSize$volSizeUnit
+autosize=$autosize$asUnit
+
+#I used the following 3 lines for troubleshooting
+#echo \*\*\*\*\*\*\*\*\*
+#echo $autosize
+#echo \*\*\*\*\*\*\*\*\*
+
+#if extension we gonna use this size otherwise it is ignored
+ExtLUN_Size=`echo $lunsize + $NEWLUNSIZE | bc`
+
+
+#output
+echo
+echo "${YELLOW_F}${BOLD}************************************************${NORM}"
+echo
+echo "${YELLOW_F}${BOLD}Data:${NORM}\n"
+echo "Snapreserve: ${BOLD}$snaprsrv${NORM} \t\t\tNew lunsize: ${BOLD}$NEWLUNSIZE$unit${NORM}"
+echo "LUN type: ${BOLD}$LUNtype${NORM}\t\tIgroup: "${BOLD}$igroups${NORM}
+echo "Volume name: ${BOLD}$vol${NORM}\t\tOld volsize: ${BOLD}$volsize$volSizeUnit${NORM}\t\tNew volsize: ${BOLD}$newVolSize${NORM}"
+echo ${BOLD}$comment${NORM}
+echo ${BOLD}$newLunName${NORM}
+
+
+echo "\n\n${YELLOW_F}${BOLD}The commands:${NORM}\n"
+
+#set what "Doit" should do
+COMMAND="echo "
+Doit
+
+#not necessary anymore as the unit is checked
+#if [[ "$origautosize" != "" && "$asUnit" != "GB" ]]
+#then
+#	echo "\n${MAGENTA_F}Check autosize, the unit is ${BOLD}$asUnit${NORM} not GB!!!"
+#fi
+echo
+echo "${YELLOW_F}${BOLD}************************************************${NORM}"
+echo
+if [ -z $NO_MIRROR ]; then
+	echo "You have to check the ${BOLD}DR${NORM} site if any for the volume ${BOLD}$vol${NORM} to be big enough to replicate to!!!"
+	echo "Here are the DR side commands:"
+	echo
+	COMMAND="echo "
+	DrDoit
+	echo "${YELLOW_F}${BOLD}************************************************${NORM}"
+fi
+
+echo
+
+if [[ "$ELES" == "-eles" ]]
+then
+	USER_RESPONSE="y"
+	echo "${MAGENTA_F}I am running the commands in 5 seconds!${NORM}"
+	sleep 5
+else
+	printf "Do you want me to run those commands? (y/n) "
+	USER_RESPONSE=`GetChar`
+	printf "\n"
+fi
+
+#echo "*********$USER_RESPONSE*************"
+case "$USER_RESPONSE" in
+	" y"|"y")
+		includeFromOutput="/vol/|LUN Size|OS|State|Comment|Maps|Reservation|Multiprotocol"
+		includeFromMapped="Vserver|\-\-\-\-|entries|^  $"
+		COMMAND="ssh -n $FILER"
+		Doit
+		echo $YELLOW_F$BOLD"Result:"$NORM$BOLD
+		if [ "$fType" == "seven" ];then
+			echo "$FILER> lun show -v $newLunName" > $RESULTFILE
+		else
+			echo "$FILER::> lun show -v $newLunName" > $RESULTFILE
+		fi
+		ssh $FILER lun show -v $newLunName | egrep "$includeFromOutput" >> $RESULTFILE
+		if [[ $fType == "cluster" ]];then
+			ssh $FILER lun mapped show $newLunName | egrep -v "$includeFromMapped" >> $RESULTFILE
+		fi
+		#if NO_MIRROR not specified, we need to update DR
+		if [ -z $NO_MIRROR ]; then
+			COMMAND="ssh -n $mirrorfiler"
+			SM_UPDATE=yes
+			DrDoit
+			if [ "$EXTEND" != "yes" ];then
+				if [[ "$fType" == "seven" ]];then
+					echo "\nDisaster Recovery (DR) site:" >> $RESULTFILE
+					echo "$mirrorfiler> lun show -v $newLunName" >> $RESULTFILE
+					ssh $mirrorfiler lun show -v $newLunName | egrep "$includeFromOutput" >> $RESULTFILE
+				else
+					echo "$mirrorfiler::> lun show -v $newLunName" >> $RESULTFILE
+					ssh $mirrorfiler lun mapped show $newLunName | egrep -v "$includeFromMapped" >> $RESULTFILE
+				fi
+			fi
+		fi
+		
+		cat $RESULTFILE
+		printf "\n\n\nBest Regards,\nSAN Team\n" >> $RESULTFILE
+		echo $NORM
+		if [ ! -z $CO_NUM ];then
+			SUBJECT="Extension of $ORIGLUN, CO $CO_NUM"
+		else
+			SUBJECT="Extension of $ORIGLUN, no CO number was provided..."
+		fi
+		cat $RESULTFILE|mailx -r sanadmin@citco.com -s "$SUBJECT" $MAILTO
+		;;
+	*)
+		echo "OK, bye"
+		;;
+esac
+
+rm $REMOVEFILE 2>/dev/null
+

@@ -1,0 +1,186 @@
+#!/bin/ksh
+#
+#This script is same as /SAN/Tools/bin/NtapSnapshotReport, but for cDOT filers
+#
+#Writable volume list: mic1 vol show | grep RW | grep -v vol0 | awk '{print $2}'
+#
+#Snapshot that could be checked: mic1 snap show \* -fields create-time | egrep -v "hourly|daily|weekly|rootvol|snapmirror|clone|entries|\-\-\-|vserver"
+#mia0vmsan01 pod247_aexdata CO125833.2014-05-23_0110 "Thu May 22 19:24:20 2014"
+#
+#Author: Geri
+#version 0.1 - initial version
+#Date:	 2014/07/07
+#
+#version 0.11
+#Date: 2014/07/08
+#Changes: bug fixes
+#
+#verson 0.12
+#Date: 2014/07/08
+#Changes: added DeleteCounter
+
+
+#######################################################
+#                Preparation Steps                    #
+#######################################################
+
+#this is the directory, where the script is, so we use the modules from the exact same dir
+BASE_DIR=$(dirname $0)
+
+#we need to check if the scriopt was called with a symlink. if yes, then we search for the /lib folder
+if [ ! -e "$BASE_DIR/lib" ];then
+	isLink=`readlink $0`
+	if [ "$isLink" == "" ];then
+		echo "The folder $BASE_DIR/lib does not exist, exiting..."
+		exit
+	else
+		BASE_DIR=`echo $isLink |sed -e 's!/[^\/]*$!!'`
+ 	fi
+fi
+
+
+TMP_DIR="$BASE_DIR/tmp"
+LOG_FILE="$BASE_DIR/tmp/cDOT_SnapShotCheck.log"
+VOL_TEMP="$BASE_DIR/tmp/cDOT_SSh_Tmp"
+ERR_FILE="$BASE_DIR/tmp/cDOT_SnapShotCheckERR.log"
+MaxLogSize=20480 #20kB
+RunLog="$BASE_DIR/tmp/cDOT_SnapShotRun.log"
+exceptfile="$BASE_DIR/etc/snapmirror.except"
+Modules="$BASE_DIR/lib/Snapmirror_Module $BASE_DIR/lib/StandardNTAP_Module"
+initscript="/opt/CITCOSan/Drivers/Driver_init"
+myname="cDOTSnapshotReport"
+MAIL_REC="sanadmin@citco.com" #
+SNAP_OLD=30
+DELETE="no"
+DeleteCounter=0
+version=0.12
+
+MAIL_SENDER="cDOT SnapCheck"
+
+GNUdate=/usr/local/bin/date
+if [ ! -e $GNUdate ];then
+    echo "$GNUdate does not exist on this system, I cannot work without it!\nExiting..." | tee -a $RunLog $LOG_FILE
+    echo "$GNUdate does not exist on this system, I cannot work without it!" | mailx -r $MAIL_SENDER -s "Snapmir script alert!! $version" $MAIL_REC
+    exit 9
+fi
+StartTime=`$GNUdate +%s`
+
+#######################################################
+#                    Procedures                       #
+#######################################################
+
+Usage ()
+{
+	ColorInit
+	echo "${BOLD}Synopsis:$NORM"
+	echo "   This script checks for old snapshots on the clustered systems"
+	echo "   Sends the results to CTM-OPS-IOS-SAN team."
+	echo "$BOLD   Version: $version"
+	echo
+	echo "${BOLD}Usage:"
+	echo "   cDOTSnapshotReport [-o days] [-d] [-m mailaddress]$NORM"
+	echo "   You don't need to specify any anything. In that case all the cDOT systems will be checked, with the default 30 days, no deletion, report sent to SAN team."
+	echo "   ${BOLD}-o${NORM}  Specifies how old or older snapshots you want to check for"
+	echo "   ${BOLD}-d${NORM}  If specified, then the found snapshot will be deleted"
+	echo "   ${BOLD}-m${NORM}  If specified, only that address will get the mail. It can be multiple addresses, devided by \",\""
+	echo
+	echo "${BOLD}Examples:${NORM}"
+	echo "   ${BOLD}${BLUE_F}$myname -o 14 -d -m glaszlo@citco.com,xgomez@citco.com${NORM}"
+	echo "		It will check for snapshots 14 days old or older, deletes them, and sends the report only to glaszlo@citco.com,xgomez@citco.com mail addresses."
+}
+
+#######################################################
+#                    Main Script                      #
+#######################################################
+
+#if [ $# -eq 0 ]; then
+#	Usage
+#	exit 1
+#fi
+
+#Source in modules from the same folder where the script is
+for module in $Modules;do
+    if [ -s $module ]; then
+        . $module
+    else
+        echo "The module library $module doesn't exist..."
+		echo "Exiting..."
+		exit 11
+	fi
+done
+													
+while getopts o:dm: opt
+do
+	case $opt in
+		o) SNAP_OLD=$OPTARG;;
+		d) DELETE="yes";;
+		m) MAIL_REC=$OPTARG;;
+		*) Usage;exit 1;;
+	esac
+done
+		
+LogRota $RunLog $MaxLogSize
+> $LOG_FILE
+> $ERR_FILE
+
+#we need to convert the given days to secunds
+SNAP_OLD_insec=`echo "scale=0;$SNAP_OLD*86400"|bc`
+
+if [[ "$CLUSTERS" == "" ]];then
+	. $initscript
+fi
+
+#get the list of clusters
+CDOTCLUSTER=`GetCtrlrList|grep clustered|awk -F: '{print $1}'`
+
+for NetAppClu in $CDOTCLUSTER; do
+	echo Working on $NetAppClu...
+	ssh $NetAppClu vol show > $VOL_TEMP
+	cluDate=`ssh $NetAppClu date | grep : | head -1 | awk '{print $1, $2, $3, $4, $5}'`
+	cluDateInUnix=`$GNUdate -d "$cluDate" +%s`
+	#error check
+	VolumesToCheck=`cat $VOL_TEMP | dos2unix 2>/dev/null | grep RW | grep -v vol0 | awk '{print $2}' `
+	rm $VOL_TEMP 2>/dev/null
+	ssh $NetAppClu snap show \* -fields create-time | dos2unix 2>/dev/null | egrep -v "hourly|daily|weekly|rootvol|snapmirror|clone|entries|\-\-\-|vserver" > $VOL_TEMP-base
+	#We need to handle the volumes that are offline. The output is someting like this:
+	#
+	egrep \" $VOL_TEMP-base > $VOL_TEMP
+	egrep "information|Vserver" $VOL_TEMP-base | sed -e 's/Info: /@/' -e 's/ *//' | sed '1s/^@//' | tr '\n' ' ' | tr '@' '\n' > $ERR_FILE-tmp
+	if [ -s $ERR_FILE-tmp ]; then
+		echo "\nThere are offline volumes on $NetAppClu:" >> $ERR_FILE
+		cat $ERR_FILE-tmp >> $ERR_FILE
+		echo >> $ERR_FILE
+	fi
+	rm $VOL_TEMP-tmp 2>/dev/null
+	
+	for volume in $VolumesToCheck; do
+		egrep $volume $VOL_TEMP > $VOL_TEMP-$volume
+		cat $VOL_TEMP-$volume | while myLine=`line`
+		do	
+			echo $myLine | sed 's/"//g' | read vmsan vol snapshot timestamp
+			snapTimeInUnix=`$GNUdate -d "$timestamp" +%s`
+			Delta=`echo "scale=0;$cluDateInUnix-$snapTimeInUnix"|bc`
+			if [ $Delta -gt $SNAP_OLD_insec ]; then
+				if [ "$DELETE" == "yes" ]; then
+					echo "Deleting snapshot $snapshot from volume $volume" | tee -a $LOG_FILE
+					ssh -n $NetAppClu snap delete $volume $snapshot
+					if [ $? -ne 0 ];then
+						echo "There was a connection issue deleting snap $snapshot from vol $volume!" | tee -a $LOG_FILE
+						echo "There was a connection issue deleting snap $snapshot from vol $volume at $cluDate" >> $RunLog
+					else
+						(( DeleteCounter += 1 ))
+					fi
+				else
+					echo "Delete was NOT requested, the snapshot $snapshot is older than $SNAP_OLD days on $vol!" | tee -a $LOG_FILE
+				fi
+			fi
+		done
+		rm $VOL_TEMP-$volume 2>/dev/null	
+	done
+done
+
+if [ ! -z "$MAIL_REC" ] ; then
+	cat $LOG_FILE $ERR_FILE| mailx -s "Snapshot report on the clustered systems" $MAIL_REC
+fi
+rm $LOG_FILE $ERR_FILE 2>/dev/null
+LogRun "Delete=$DELETE Snaps to check: $SNAP_OLD days and older, $DeleteCounter snapshot deleted."

@@ -1,0 +1,180 @@
+#!/bin/ksh
+#
+#
+#
+#This module contains standard procedures for the NTAP Library
+#
+#Author: Geri
+#
+#Created: 2014/05/08
+#
+#Version 0.1
+#	Inital version, 2 procedures: LogRota, ColorInit
+#Version 0.2
+#	Added Init proc, 2014/05/21
+#Version 0.25
+#	Added LogRun, 2014/07/08
+#Version 0.26
+#	Added UpdateSpinner, 2014/08/08
+#Version 0.27
+#	Added GetChar, 2014/09/30
+#Version 0.28
+#	Added CheckSpaceOnAggregate and CheckLunCreationTime, 2015/01/28
+
+GNUdate=/usr/local/bin/date
+
+#Procedures
+#	LogRota:	Rotates the given log file. It excepts 2 variables: logfile and the allowed max size
+#	ColorInit:	Initalizes varables to use colors. Linux/Solaris compatible
+#	Init: 		Initializes common variables
+#	LogRun:		Logs the runtime to the log file
+#	UpdateSpinner:	Displays a spinner
+#   GetChar:    Reads exactly one character from keyboard
+#	CheckSpaceOnAggregate: Checks space on an aggregate on a given filer if you want to occupy more space
+#	CheckLunCreationTime:  Checks if the lun was created in the last 24 hours
+
+LogRota ()
+{
+	typeset LogFile MaxSize CheckSize
+	LogFile=$1
+	MaxSize=$2
+	if [ -e $LogFile ];then
+		CheckSize=`ls -l $LogFile | awk '{print $5}'`
+		if [ $CheckSize -gt $MaxSize ];then
+			for i in `seq 4 -1 0`;do
+				mv $LogFile.$i $LogFile.$(($i+1)) 2>/dev/null
+			done
+			mv $LogFile $LogFile.0
+			echo "$LogFile was rotated."
+		else
+			echo "The size of $LogFile is smaller than the threshold, nothing to rotate"
+		fi
+	else
+		echo "$LogFile doesn't exist, nothing to rotate."
+	fi
+}
+
+ColorInit ()
+{
+	#Colors to make the output look better, it works both on Solaris and Linux
+	if [ -e /etc/release ];then
+    	BOLD="\\033[1m"
+	    NORM="\\033[0m"
+    	YELLOW_F="\\033[33m"; YELLOW_B="\033[43m"
+	    RED_F="\\033[31m"
+    	MAGENTA_F="\\033[35m"
+	    CYAN_F="\\033[36m"
+    	BLUE_F="\\033[34m"
+	else
+    	BOLD=$'\e[1m'
+	    NORM=$'\e[0m'
+		YELLOW_F=$'\e[33m'; YELLOW_B=$'\e[43m'
+		RED_F=$'\e[31m'
+		MAGENTA_F=$'\e[35m'
+		CYAN_F=$'\e[36m'
+		BLUE_F=$'\e[34m'
+	fi
+}
+
+Init ()
+{
+	DCLIST=`/santeam/bin/GetCtrlrList|awk -F: '{print $NF}'|sort|uniq`
+	FILERS_7Mode=`/santeam/bin/GetCtrlrList|grep -vi clustered|awk -F: '{print $1}'`
+	CLUSTERS=`/santeam/bin/GetCtrlrList|grep -i clustered |awk -F: '{print $1}'`
+	SWITCHES=`/santeam/bin/GetBrocadeList|awk -F: '{print $1 ":" $4}'`
+	for cluster in $CLUSTERS; do
+		filers=`ssh $cluster node show -fields node | dos2unix 2>/dev/null | grep sanfiler`
+		filers=`echo $filers | sed 's/ /,/g'`
+		FILERS_CMode="$FILERS_CMode $cluster:$filers"
+	done
+}
+
+LogRun ()
+{
+	AtTime=`$GNUdate +"%Y/%m/%d %H:%M"`
+	if [ "$StartTime" == "" ];then
+		echo "\nPlease initialize the variable StartTime, othervise I cannot log the length of the run!"
+		echo "Put this line into your script at the beginning:"
+		echo "StartTime=i\`\$GNUdate +%s\`"
+		echo "At $AtTime finished running. Options were: $*" | tee -a $RunLog
+	else
+		FinishTime=`$GNUdate +%s`
+		RunTime=`echo "$FinishTime-$StartTime"|bc`
+		RunTime=`$GNUdate -d @$RunTime +"%H:%M:%S" -u`
+		echo "At $AtTime finished running in $RunTime. Options used: $*" | tee -a $RunLog
+	fi
+}
+
+#Spinner=(/ - \\ \| / - \\ \| )
+set -A Spinner / - \\ \| / - \\ \|
+Spinnerpos=0
+UpdateSpinner()
+{
+    printf "\b"${Spinner[$Spinnerpos]}
+    (( Spinnerpos=(Spinnerpos +1)%8 ))
+}
+
+GetChar ()
+{
+	#Reads exactly one character from keyboard, and places in USER_RESPOND
+	printf "$1 "
+	USER_RESPONSE=""
+	stty raw
+	USER_RESPONSE=`dd bs=1 count=1 2> /dev/null`
+	stty -raw
+	echo $USER_RESPONSE
+}
+
+CheckLunCreationTime ()
+{
+	CheckLUN=$2
+	typeset filer=$1
+	typeset fType=$3
+
+	if [ "$fType" == "seven" ];then
+		LUNDate=`ssh $filer lun show -v $CheckLUN | grep "Creation Time" | sed 's/Creation Time://' | awk '{print $2, $3, $4, $6}'` 
+		CurrentDate=`ssh $filer date | awk '{print $2, $3, $4, $6}'`
+	else
+		LUNDate=`ssh $filer lun show -v $CheckLUN | dos2unix 2>/dev/null | grep "Creation Time" | sed 's/Creation Time://'`
+		CurrentDate=`ssh $filer date | dos2unix 2>/dev/null | grep : | head -1 | awk '{print $2, $3, $4, $5}'`
+	fi
+	
+	LUNDate=`$GNUdate --date="$LUNDate" +%s`
+	CurrentDate=`$GNUdate --date="$CurrentDate" +%s`
+	((LUNAge=CurrentDate-LUNDate))
+	echo $LUNAge
+}
+
+CheckSpaceOnAggregate ()
+{
+	typeset filer=$1
+	typeset vol=$2
+	typeset incr=$3
+	typeset fType=$4
+
+	typeset aggrName=""
+	typeset Total=""
+	typeset Used=""
+	typeset Available=""
+	typeset AvailPercent=""
+	typeset NewPercent=""
+
+	if [ "$fType" == "seven" ];then
+		aggregate=`ssh $filer vol status $vol | ggrep -i containing | awk -F\' '{print $2}'`
+	else
+		aggregate=`ssh $filer vol show $vol | dos2unix 2>/dev/null | grep $vol | awk '{print $3}'`
+	fi
+	ssh $filer df -A -g $aggregate | dos2unix 2>/dev/null | ggrep -vE "Aggregate|snap|entries were displayed" | sed 's/GB//g' | read aggrName Total Used Available AvailPercent
+	NewPercent=$(echo "scale=2;($Used+$incr)/$Total*100"|bc)
+	NewPercent=`echo $NewPercent | awk -F. '{print $1}'`
+	#for troubleshooting
+	#echo $aggrName $Total $Used $Available $AvailPercent >&2
+	#echo "After: $((Available-incr)) and $NewPercent" >&2
+
+	if [[ $((Available-incr)) -lt 1000 || $NewPercent -gt 94 ]];then
+		echo "\nAfter the change the remaining space would only be: $BOLD$((Available-incr))GB$NORM and the usage would be $BOLD$NewPercent%$NORM on $aggregate aggr!!!" >&2
+		echo "N"
+	else
+		echo "Y"
+	fi
+}

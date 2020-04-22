@@ -1,0 +1,28 @@
+#!/bin/ksh
+#
+#
+#This is a quick 'n' dirty script to check snapvault status on mia13/14
+#
+#
+#
+#version 0.01
+#author: Geri
+
+SVcheck=snapvaultcheck
+workdir=/santeam/tmp
+MAIL_SENDER=SnapVaultCheck
+MAIL_REC="sanadmin@citco.com"
+RunLog=snapvaultcheck_runlog
+
+cd $workdir
+
+ssh mia0sanfiler13 snapvault status|egrep -v "Snapvaulted|Snapvault secondary|Source" > $SVcheck
+ssh mia0sanfiler14 snapvault status|egrep -v "Snapvaulted|Snapvault secondary|Source" >> $SVcheck
+
+if [[ -s $SVcheck ]] ; then
+	cat $SVcheck | mailx -r $MAIL_SENDER -s "SnapVaultCheck on mia13/14" $MAIL_REC
+else
+	echo "minden ok"|  mailx -r $MAIL_SENDER -s "SnapVaultCheck on mia13/14" glaszlo@citco.com
+fi
+
+date >> $RunLog

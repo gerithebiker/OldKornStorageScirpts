@@ -1,0 +1,143 @@
+#!/bin/ksh
+#
+#
+#This script collects all the Shelf types form all the filers 
+#and stores the info in the working dir, one file per filer
+#
+#requires gawk!
+#
+#version 1.0
+#Developer: Geri
+#Release date: 2012 December 4
+
+
+if [[ `which gawk|grep  ^/` == "" ]];then
+	echo "There is no gawk in the system, $0 cannot run!"
+	exit 1
+fi
+
+BOLD="\033[1m"
+NORM="\033[0m"
+YELLOW_F="\033[33m";
+RED_F="\033[31m"
+MAGENTA_F="\033[35m"
+CYAN_F="\033[36m"
+BLUE_F="\033[34m"
+
+workdir=/santeam/ConfigDB/Shelf
+myname=$0
+
+origdir=`pwd`
+cd $workdir
+
+Usage ()
+{
+	echo 
+	echo "Synopsis:"
+	echo "This scrip queries and/or updates the Shelf database located in $workdir"
+	echo
+	echo "Usage:"
+	echo "   ${BOLD}$myname [-u] [-q filer1 filer2 ...]${NORM}"
+	echo
+}
+
+#parameter handling
+#check the first parameter or no parameter
+if [[ "$1" == "?" || "$1" == "-h" || "$1" == "-?" || "$1" == "-help" || "$#" == 0 ]]
+then
+	Usage
+    exit 1
+fi
+
+while [ ! -z "$1" ]; do
+	case "$1" in
+		-u)	update="yes"
+			flag="update"
+			;;
+		-q) query="yes"
+			flag="query"
+			;;
+		*)	
+			a=`echo $1|sed 's/^\(.\).*$/\1/'`
+			if [ $a == "-" ];then
+				Usage $1
+				exit 1
+			fi
+			case "$flag" in
+				update)
+					echo "Wrong parameter ${BOLD}$1$NORM"
+					Usage
+					exit 1
+					;;
+				query)
+					queryfilers="$queryfilers $1"
+					;;
+				*)
+					echo "Wrong parameter"
+					exit 1
+					;;
+			esac
+	esac
+	shift
+done
+
+			
+
+
+Update ()
+{
+	echo
+	echo "Update is running, it can take a while..."
+	echo "Reading in filer and cluster names."
+	. /opt/CITCOSan/Drivers/Driver_init
+	
+	echo "Starting to work in 7mode filers"
+	for filer in $FILERS
+	do
+		#this is an old format
+		#ssh $filer environment status shelf |egrep "Channel|Shelf:|product identification|Product Serial|^$"|gawk 'BEGIN {RS="\n\n";FS="\n";}{print $1, $2, $3, $4}' | sed 's/Channel: //' | sed 's/Shelf:/./' | sed 's/product identification=/: /' | sed 's/ //g' | tr -d '\011' | sed '/^$/d' | sed 's/:/ : /' > $filer
+		echo "   Working on $filer"
+		ssh $filer environment status shelf |egrep "Channel|Shelf:|product identification|Product Serial|^$"|gawk 'BEGIN {RS="\n\n";FS="\n";}{print $3, $2, $4 $5}' | sed 's/Channel: //' | sed 's/Shelf: //' | sed 's/product identification=//' | sed 's/Product Serial Number://' | sort -k 2 | egrep -v "^  *$" > $filer
+		echo "   Info for ${BOLD}$filer$NORM is updated."
+	done
+	
+	echo "Starting to work on CDOT filers"
+	for clusters in $CLUSTERS
+	do
+		echo $clusters|awk -F: '{print $1, $2, $3}'|read cluster_name vservers nodes
+		#echo c=$cluster_name v=$vservers n=$nodes
+		for node in `echo $nodes|sed 's/,/ /g'`
+		do
+			echo "   Working on node ${BOLD}$node$NORM"
+#			2> /dev/null
+			#echo ssh $cluster_name run -node $node environment status shelf
+			ssh $cluster_name run -node $node environment status shelf | dos2unix  2>/dev/null| egrep "Channel|Shelf:|product identification|Product Serial" | sed 's/Channel:/		/' | gawk 'BEGIN {RS="\t\t";FS="\n";}{print $2, $1, $3 $4}' | sed 's/Shelf: *//' | sed 's/product identification=//' | sed 's/Product Serial Number://' | sort -k 2 | egrep -v "^      *$" > $node
+			echo "   Info for ${BOLD}$node$NORM is updated."
+			#> temp_$node 
+			#echo lekerdeztem
+			#cat temp_$node |egrep "Channel|Shelf:|product identification|Product Serial" | sed 's/Channel:/		/' | dos2unix  | gawk 'BEGIN {RS="\t\t";FS="\n";}{print $1, $2, $3 $4}' | sed 's/Shelf: //' | sed 's/product identification=//' | sed 's/Product Serial Number://' | sort -k 2 | egrep -v "^      *$" > $node
+		done
+	done
+	echo "DB is updated"
+	echo
+}
+
+Query ()
+{
+	for filer in $queryfilers
+	do
+		echo $filer
+		cat $filer
+		echo
+	done
+}
+
+#Main
+if [[ "$update" == "yes" ]];then
+	Update
+fi
+
+if [[ "$query" == "yes" ]];then
+	Query
+fi
+

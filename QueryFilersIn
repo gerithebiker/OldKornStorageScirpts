@@ -1,0 +1,107 @@
+#!/bin/ksh
+#
+#
+#This script is to query filers in a DC
+#The variable FILERS must be initialized, if not, it will source it
+#A few commands are not permitted to run...
+#
+#  Developer: Geri
+#Last change: 06/06/2013
+
+#color setting
+BOLD="\033[1m"
+NORM="\033[0m"
+YELLOW_F="\033[33m"
+RED_F="\033[31m"
+MAGENTA_F="\033[35m"
+CYAN_F="\033[36m"
+BLUE_F="\033[34m"
+
+MYNAME=QueryFilersIn
+VERSION="1.0"
+
+Usage ()
+{
+	echo   "${BOLD}Synopsis:$NORM"
+	printf "   This script runs the given command against all the filers in a DataCenter\n"
+	echo
+	echo "${BOLD}Usage:"
+	echo "   $MYNAME DataCenter \"query\" [\"grep string\"] [-d]$NORM"
+	echo
+	printf "   The DataCenter could be a regular expression, for example \"atl|mia\"\n"
+	printf "   If the command you want to run has switch, put it into quotation mark: \"df -Ag\"\n"
+	printf "   If you want to grep something, put it as the third parameter, it is optional\n\n"
+	printf "   ${BOLD}-d$NORM Optional switch if you want a devider line between the filers\n\n"
+	printf "${BOLD}Examples:${NORM}\n"
+	printf "   ${BOLD}${BLUE_F}$MYNAME \"brn|gen\" \"df -Ag\" \"-v snap\" -d${NORM}\n"
+	printf "\t   Queries all the filers in Bern and Geneva about the aggregate usage, exclude the snapshots\n"
+	printf "   ${BOLD}${BLUE_F}$MYNAME atl \"ifconifg -a\"${NORM}\n"
+	printf "\t   Runs \"ifconfig -a\" in all filers in Atlanta\n\n"
+    	
+}
+
+if [[ $# -lt 2 || $1 == "-?" || $1 == "-h" ]]; then Usage; exit; fi
+
+if [ -z $FILERS ]; then
+	echo "FILERS are not initialized, running . /opt/CITCOSan/Drivers/Driver_init"
+	. /opt/CITCOSan/Drivers/Driver_init
+fi
+
+DataCenter=$1
+shift
+Query=$1
+TestQuery=`echo $Query | awk '{print $1}'`
+if [[ $TestQuery == "halt" || $TestQuery == "reboot" || $Query == "cifs terminate" || $Query == "nfs off" || $Query == "snapmirror off" ]]; then
+	echo "${BOD}${MAGENTA_F}Are you kidding me????${NORM}"
+	echo "This commands are not allowed:"
+	echo "halt"
+	echo "reboot"
+	echo "cifs terminate"
+	echo "nfs off"
+	echo "snapmirror off"
+	exit 1
+fi
+shift
+while [ ! -z $1 ]; do
+	case $1 in
+		-d)	Devider=yes;;
+		*)	GrepString=$1
+#			GrepStTest=`echo GrepStringTmp | sed 's/\(.\)\(..*\)/\1/'`
+#			if [[ $GrepStTest == "-" ]]; then
+#				GrepStrin=`echo GrepStringTmp | awk '{print $1}'`
+#				GrepSwitch=`echo GrepStringTmp | sed 's/\(..* \)\(..*\)/\2/'`
+#			fi
+		
+		;;
+	esac
+	shift
+done
+
+
+echo DC=$DataCenter Query_to_run=$Query Devider=$Devider Grep=$GrepString
+echo
+
+if [[ ! -z $Devider ]]; then
+	Devider="\n*************************************************************\n\n"
+else
+	Devider="\n\n"
+fi
+
+QueryFilers=`for j in $FILERS; do echo $j; done|egrep "$DataCenter"`
+if [ -z $QueryFilers ]; then
+	echo "Wrong site name: $DataCenter"
+else
+	for filer in $QueryFilers; do 
+		if [ -z $filer ]; then
+			echo "Wrong site name: $DataCenter"
+		else
+			echo $filer
+		fi
+		if [ -z $GrepString ]; then
+			ssh $filer $Query
+		else
+			ssh $filer $Query | egrep $GrepSwitch "$GrepString"
+		fi	
+		printf "$Devider"
+	done
+fi

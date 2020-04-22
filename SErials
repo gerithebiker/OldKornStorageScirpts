@@ -1,0 +1,94 @@
+#!/bin/ksh
+#
+#
+#This script is to query serial numbers 
+#
+#  Developer: Geri
+#Last change: 10/03/2013
+#
+#Change history
+#
+#
+#
+#color setting
+BOLD="\033[1m"
+NORM="\033[0m"
+YELLOW_F="\033[33m"
+RED_F="\033[31m"
+MAGENTA_F="\033[35m"
+CYAN_F="\033[36m"
+BLUE_F="\033[34m"
+
+MYNAME=SErials
+VERSION="1.0"
+DBFile="/santeam/ConfigDB/SerialNumers"
+
+
+Usage ()
+{
+	echo   "${BOLD}Synopsis:$NORM"
+	printf "   This scriopt queries filer and brocade serial numbers from the offline file $DBFile\n" 
+	printf "   The query string can be a regexp.\n"
+	echo
+	echo "${BOLD}Usage:"
+	echo "   $MYNAME searchstring [-u]"
+    echo "   If the second parameter is \"-u\", then first the db will be updated."	
+	echo
+	echo "   It does NOT update the Brocade info!!"
+}
+
+if [[ $# -lt 1 || $1 == "-?" || $1 == "-h" ]]; then Usage; exit; fi
+
+Update ()
+{
+	. /opt/CITCOSan/Drivers/Driver_init
+	if [ ! -e $DBFile ]; then
+		echo DeviceName Serial_Number Model Current_OS_Version > $DBFile
+	fi
+	for filer in $FILERS
+	do 
+		echo "Working on $filer"
+		raw=`ssh -n $filer sysconfig -a | head | egrep "Model Name|Serial"`
+	  	SN_n_Model=`echo $raw | awk '{print $4, $8}'`	
+		Version=`ssh -n $filer version | awk '{print $3}' | sed 's/://'`
+		TestFiler=`grep $filer $DBFile`
+		#if filer doesn't exist in the DBFile, then append otherwise update 
+		if [[ "$TestFiler" == "" ]]; then
+			echo $filer $SN_n_Model $Version | tee -a $DBFile
+		else
+			cat $DBFile | sed '/'"$filer "'/s/^..*/'"$filer $SN_n_Model $Version"'/' > ${DBFile}_temp
+			rm $DBFile
+			mv ${DBFile}_temp $DBFile
+		fi
+	done
+	
+	#Clusters
+	for clusters in $CLUSTERS
+	do
+		echo $clusters|awk -F: '{print $1, $2, $3}'|read cluster_name vservers nodes
+		#echo c=$cluster_name v=$vservers n=$nodes
+		for node in `echo $nodes|sed 's/,/ /g'`
+		do
+			echo "Working on $node"
+			raw=`ssh $cluster_name run -node $node sysconfig -a | head | dos2unix 2>/dev/null| egrep "Model Name|Serial"`
+			SN_n_Model=`echo $raw | awk '{print $4, $8}'`
+			Version=`ssh $cluster_name run -node $node version | awk '{print $3}'`
+			TestNode=`grep $node $DBFile`
+			if [[ "$TestNode" == "" ]]; then
+				echo $node $SN_n_Model $Version | tee -a $DBFile
+			else
+				cat $DBFile | sed '/'"$node "'/s/^..*/'"$node $SN_n_Model $Version"'/' > ${DBFile}_temp
+				rm $DBFile
+				mv ${DBFile}_temp $DBFile
+			fi
+		done
+	done
+}
+
+
+if [[ "$2" == "-u" ]];then
+	Update
+fi
+
+egrep "Device|$1" $DBFile
+

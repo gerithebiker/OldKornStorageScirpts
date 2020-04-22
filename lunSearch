@@ -1,0 +1,572 @@
+#!/bin/ksh
+#
+#
+#This script searches for LUN(s) given as parameters
+#It is searching in an OFFLINE database, specified in the variable section
+#Detailed info in the Usage routine
+#
+#version 2.5
+#author: Geri
+#change list
+#2.1
+#	added color for more nice output
+#	offline database in $workfolder
+#2.2
+#	added support for updating individual filers
+#	-f as a new switch for the filer list
+#2.3
+#	added checking if all the offline files exist compared to the number of filers
+#2.4
+#	changed the meaning of -f switch
+#	added -c to check if all the filer have 
+#2.5
+#	added -r to generate unmap commands
+#	not intrusive, it places the commands on the screen
+#2.6
+#	added -v and -va to search the vol DB
+#	added the ClusterUpdate routine to collect the info from the clusters
+#	checked the Search routine if works with the cluster info
+#	updated the DB check routine
+#	
+#2.7
+#	The original update algorithm had a limitation, if a lun was mapped to more than one igroups,
+#	then the third and the rest of the igroups were missed out. The 7mode update routin has been 
+#	completely updated, it is about 2x as fast now as before
+#
+#2.71
+#	Changed the color part, it works on Linux correctly
+#
+#2.72
+#	Added the LUN serial numbers to the DB, so it is searchable now
+
+#Variables
+workfolder="/santeam/ConfigDB/OfflineLunDB" #for prod
+#workfolder="/santeam/OfflineLunlistTEST" #for testing
+VolumeDir="/santeam/ConfigDB/NumberOfVolumes"
+fpref="full_"
+#fpref="test_"
+ftmp="tmp_"
+myname="lunSearch"
+version="2.72"
+myfullname=$0
+parancs=commandfile #to collect the lun unmap commands
+
+initscript="/opt/CITCOSan/Drivers/Driver_init"
+initiated="" #the init script nol loaded yet
+check=""
+sf=0 #number of filers to search
+
+if [ -e /etc/release ];then
+	BOLD="\\033[1m"
+	NORM="\\033[0m"
+	YELLOW_F="\\033[33m"; YELLOW_B="\033[43m"
+	RED_F="\\033[31m"
+	MAGENTA_F="\\033[35m"
+	CYAN_F="\\033[36m"
+	BLUE_F="\\033[34m"
+else
+	BOLD=$'\e[1m'
+	NORM=$'\e[0m'
+	YELLOW_F=$'\e[33m'; YELLOW_B=$'\e[43m'
+    RED_F=$'\e[31m'
+	MAGENTA_F=$'\e[35m'
+	CYAN_F=$'\e[36m'
+	BLUE_F=$'\e[34m'
+fi
+
+Usage ()
+{
+ #echo "I was invoked as: ${BOLD}$myfullname"
+ echo ${BOLD}
+ #this is only for a nicer output
+ if [[ "$h" == "?" || "$h" == "-h" || "$h" == "-?" || "$h" == "-help" ]]
+ then
+	echo "$myname: help was requested"
+ else
+ 	if [  "$1" == "" ]
+	then
+		echo "$myname: Insufficient arguments (0)"
+	else
+		echo "$myname: bad parameter $1"
+	fi
+ fi
+ echo
+ echo "Synopsis:"
+ echo "${NORM}   This script searches for LUN names in an offline database case ${BOLD}insensitively${NORM}"
+ echo "   ${BOLD}Version: $version"
+ echo
+ echo "Usage:"
+ echo "   ${BOLD}$myname [-s] [search pattern] [-f] [filer1 filer2 ...] [-u] [filer1 filer2 ...] [-c]${NORM}"
+ echo
+ echo "   ${BOLD}-u ${NORM} Updates the DB,  it could be anywhere in the parameter list. If \"all\" follows ${BOLD}-u${NORM} "
+ echo "       or no filer name or other switch, then the whole DB will be updated."
+ echo "   ${BOLD}-s${NORM}  Specifies the search pattern. If you put the search pattern in front, you don't"
+ echo "       need to use ${BOLD}-s${NORM} switch, but if you use ${BOLD}-f${NORM} or ${BOLD}-u${NORM} switch first, then you have to specify"
+ echo "       the search pattern by using ${BOLD}-s${NORM}." 
+ echo "   ${BOLD}-f${NORM}  Specifies on which filer to search, could be useful when you search"
+ echo "       for something that could result many hits, like an ${BOLD}igroup${NORM}."
+ echo "       For clusters, use the virtual filer name, like ${BOLD}atl0vmsan01$NORM"
+ echo "   ${BOLD}-c${NORM}  Check if all the filers have data in the DB, and shows the date when was the DB last time updated."
+ echo "   ${BOLD}-r${NORM}  Generates lun unmap commands for all the hits."
+ echo "   ${BOLD}-v${NORM}  Searhes for the specified volumes in the volume DB in $VolumeDir, but only in the last results"
+ echo "   ${BOLD}-va${NORM} Searhes for the specified volumes in the volume DB in $VolumeDir, in all the previous verions"
+ echo "       (The vol DB is updated once a week, all historical data are kept. We don't have data from the clusters,"
+ echo "        as the clusters have information about the volume creation time.)"
+ echo  
+ echo "   You can specify more than one string to search at a time, and the search pattern"
+ echo "   could be regular expression."
+ echo "   If you give an ${BOLD}igroup${NORM} name as a search pattern, all the LUNs will be listed that"
+ echo "   mapped to the igroup."
+ echo 
+ echo "${BOLD}Examples:${NORM}"
+ echo "   ${BOLD}${BLUE_F}$myname -u${NORM}"
+ echo "          Updates the database"
+ echo "   ${BOLD}${BLUE_F}$myname rightfax gen0vmmsctx17 -u${NORM}"
+ echo "          First updates the database, then searches the string rightfax and gen0vmmsctx17"
+ echo "   ${BOLD}${BLUE_F}$myname gen0vmmsctx1[78]${NORM}"
+ echo "          Searches for the string gen0vmmsctx17 and gen0vmmsctx18"
+ echo "   ${BOLD}${BLUE_F}$myname -u -f brn0sanfiler06 -s gen0vmmsctx17${NORM}"
+ echo "          First updates the whole DB, then searches for the string gen0vmmsctx17 in ${BOLD}brn0sanfiler06${NORM}"
+ echo "          In this case if you don't use ${BOLD}-s${NORM}, then gen0vmmsctx17 will be considered as filername!"
+ echo "   ${BOLD}${BLUE_F}$myname gen0vmmsctx17 -u -f brn0sanfiler06${NORM}"
+ echo "          Same as the previous example, but you don't need to use -s."
+ echo "   ${BOLD}${BLUE_F}$myname gen0vmmsctx17 -u brn0sanfiler06 -f brn0sanfiler06${NORM}"
+ echo "          First updates the DB only for brn0sanfiler06, then searches for the string gen0vmmsctx17 on only brn0sanfiler06."
+}
+
+h=$1
+#check the first parameter or no parameter
+if [[ "$1" == "?" || "$1" == "-h" || "$1" == "-?" || "$1" == "-help" || "$#" == 0 ]]
+then
+	Usage
+	exit
+fi
+
+#this flag is to determine what kind of parameter is the next
+#default is search 
+flag=srch
+
+#loop to handle the parameters
+while [ ! -z "$1" ]; do
+        case "$1" in
+		#We use flag to determime what kind of parameter is next
+		#The switch sets the flag, so the next argument will be put into that kind of list	
+        -f)		flag=searchfiler
+				;;
+        -s)		flag=srch
+				;;
+		-u)		update="yes"
+				flag=updatefiler
+				#updatefilers=all
+                ;;
+		-c)	   	check="yes"
+				;;
+		-r)		remove="yes"
+				;;	
+		-v)		flag=volume
+				volsearch="all"
+				;;
+		-va)	flag=volume
+				volsearch="yes"		
+				;;
+        *)      case "$flag" in
+                	searchfiler)
+                        a=`echo $1|sed 's/^\(.\).*$/\1/'`
+                        if [ $a == "-" ];then
+                                Usage $1
+                                exit
+                        else
+                                searchfilers="$searchfilers $1"
+								sf=$(( $sf + 1 ))
+                        fi
+					;;
+                   	srch)
+                        a=`echo $1|sed 's/^\(.\).*$/\1/'`
+                        if [ $a == "-" ];then
+                                Usage $1
+                                exit
+                        else
+                                luns="$luns $1"
+                        fi
+					;;
+                   	updatefiler)
+						a=`echo $1|sed 's/^\(.\).*$/\1/'`
+						if [ $a == "-" ]
+						then
+							Usage $1
+							exit
+						else
+							if [ $1 == "all" ]
+							then
+								. $initscript
+								initiated="yes"
+								UPDFILERS=$FILERS
+							else
+								if [ -z "$UPDFILERS" ]
+								then
+									UPDFILERS="$1"
+								else
+									UPDFILERS="$UPDFILERS $1"
+								fi
+							fi
+						fi
+					;;
+					volume)
+						a=`echo $1|sed 's/^\(.\).*$/\1/'`
+						if [ $a == "-" ]
+						then
+							Usage $1
+							exit
+						else
+							if [ -z "$VOLSEARCH" ]
+							then
+								VOLSEARCH="$1"
+							else
+								VOLSEARCH="$VOLSEARCH $1"
+							fi
+						fi
+					;;
+					*)
+                        Usage $1
+						exit
+					;;
+                esac
+        esac
+        shift
+done
+
+origfolder=`pwd`
+cd $workfolder
+
+Update ()
+{
+#this routine updates the offline database
+	#first we need to check if we have filers in the FILERS variable
+	if [ -z $FILERS ]
+	then
+		. $initscript
+		initiated="yes"
+	fi
+	#the init is for the filer names
+	#i use $filers for the filer list instead of $FILERS
+	#because i use this variable in the command line, so to avoid conflict... 
+	if [[ -z $UPDFILERS ]]
+	then
+		#if we don't have values in $UPDFILERS variable, then we need to update the whole DB
+		filers=$FILERS
+	else
+		#we have UPDFILERS, so we need to update only those filers' DB
+		#first we remove the vmsans, if any
+		tempfilers=`for i in $UPDFILERS;do echo $i;done | grep -v vmsan`
+	   	tempfilers=`echo $tempfilers | sed 's/ /|/g'`
+		#then we check if there is any wrong filernames in the parameters
+		#and remove them
+		#filers can be specified in the $initscript
+		filers=`for i in $FILERS;do echo $i;done | egrep "$tempfilers" 2> /dev/null`
+		if [ -z $filers ];then
+			echo "I didn't find any of ${BOLD}$UPDFILERS$NORM in the 7-mode filers!!"
+			UDSUCCESS="no"
+		fi
+	fi
+	
+
+	if [ ! -z $filers ];then
+		echo "Updating filers"
+	fi
+	
+	#FILERS="gen0sanfiler01" #this line could be useful in case of troubleshooting.
+
+	#the search
+	for filer in $filers
+	do
+		echo "Collecting data from ${CYAN_F}$filer${NORM}"
+		#removing the data for the filer currently working on
+		rm -f $workfolder/$fpref$filer
+		#collect the data for the actual filer. we keep only the line with the LUN name in it and the MAPs line, if exist
+		ssh $filer lun show -v | egrep -v "Comment|Share|Space|Multiprotocol|Occupied|Creation|Backed by" | tr "\n" "\t" > $workfolder/$ftmp$filer
+		echo >> $workfolder/$ftmp$filer
+		echo "     Parsing ${CYAN_F}$filer${NORM} data"
+		cat $workfolder/$ftmp$filer | sed 's!/vol/!@/vol/!g' | tr "@" "\n" | tr "\t" " " | sed -e 's/Maps://g' -e 's/([0123456789]*)//' -e 's/  */ /g' -e 's/line)/line) NOT_Mapped!!/' -e 's/ $//' -e '1d' -e 's/Serial#: //' > $workfolder/$fpref$filer 
+		counter=1
+		#if a lun is mapped, the output will be something like:
+		#/vol/pod999_bak_testdr/qt_pod999_bak_testdr/pod999_bak_testdr.lun     10g (10737418240)   (r/w, online, mapped)
+		#        Maps: mia0sudb01ab=1
+		#if not mapped, then the next line will be the next lun instead of a "Maps" info
+		#this why what to do with the current line must be decided on the next line. 
+		if [ ! -s $ftmp$filer ];then
+			echo "There is no lun in this filer!" > $workfolder/$fpref$filer
+		fi
+		
+		#/santeam/bin/setsame.sh $workfolder/$fpref$filer
+
+	done
+	rm $workfolder/tmp_* #2> /dev/null
+}
+
+ClusterUpdate()
+{
+	#ClusterUpdate
+   	#First we need to check, if we have filers passed as arguments to update	
+	if [ ! -z $UPDFILERS ];then
+		#we need to check, if we have CLUSTERS variable, if not, we initiate the it
+		if [ -z $CLUSTERS ];then
+			. $initscript
+		fi
+		#in this part of the "if" we have listed filers to be updated
+		#but we need to select only the vmsans
+		TEMPVMSANS=`for i in $UPDFILERS;do echo $i;done | grep vmsan`
+	   	VMSANS=`echo $TEMPVMSANS | sed 's/ /|/g'`
+		UPDATECLUSTERS=`for i in $CLUSTERS;do echo $i;done | egrep "$VMSANS" 2> /dev/null`
+		if [ -z $UPDATECLUSTERS ];then
+			echo "I didn't find any of ${BOLD}$UPDFILERS$NORM in the Clusters!!"
+			UDSUCCESS="no"
+		fi
+	else
+		if [[ "$initiated" != "yes" ]];then
+			. $initscript
+		fi
+		UPDATECLUSTERS=$CLUSTERS
+	fi
+	
+	if [ ! -z $UPDATECLUSTERS ];then	
+		echo "${BOLD}Updating clusters${NORM}"
+	fi
+
+	for i in $UPDATECLUSTERS;do	
+		VFILERS=`echo $i|awk -F: '{print $2}'`
+		for vfiler in `echo $VFILERS | sed 's/,/ /g'`;do
+			rm $fpref$vfiler
+		done
+	done
+	#The clusters are stored in this format in drive init scrip:
+	#clustername:vfiler01,...:physhead01,...
+	#Example: atl0nc01:atl0vmsan01:atl0sanfiler15,atl0sanfiler16
+	#so we need to extract the cluster name that we can connect to
+	for Cluster in `for j in $UPDATECLUSTERS;do echo $j|awk -F: '{print $1}';done`;do
+		echo "Collecting data from ${CYAN_F}$Cluster$NORM"
+		#dos2unix should be used, as the output contains \n\r!!!!!
+		ssh $Cluster lun show | dos2unix 2> /dev/null | egrep -v "^Vserver|---|entries|^$" | sort -k 2 > lun_show 
+		ssh $Cluster lun mapped show | dos2unix 2> /dev/null | egrep -v "^Vserver|---|entries|^$" | sort -k 2 > mapped_luns 
+		ssh $Cluster vol show | dos2unix > volumes 2> /dev/null
+		echo "     Parsing ${CYAN_F}$Cluster$NORM data"
+		MAX=`wc -l lun_show | awk '{print $1}'`
+		for i in `seq 1 $MAX`;do
+			FRONT=`cat lun_show | sed -n "$i"p | awk '{print $1, $2, $6, "(,", $3 ",", $4 ")"}' | sed 's/GB/g/' | sed 's/TB/t/' | sed 's/MB/m/'`
+			print "$FRONT" | read VFILER REST
+			VOLUME=`echo $FRONT|awk -F/ '{print $3}'`
+			LUN=`echo $FRONT|awk '{print $2}'`
+			MAPPED=`echo $FRONT|awk '{print $6}'|sed 's/)//'`
+			TYPE=`cat volumes | gawk -v vol=$VOLUME '{
+				if ($2 == vol){
+					print $5
+				}
+			}'`
+			case $TYPE in
+				RW) TYPE="r/w";;
+				DP) TYPE="r/o";;
+			esac
+			BACK=""
+			if [[ "$MAPPED" == "mapped" ]];then
+				grep " $LUN " mapped_luns > mapped_igroups
+				cat mapped_igroups|while MYLINE=`line`;do
+					if [ -z $BACK ];then
+						BACK=`echo $MYLINE | awk '{print $3 "=" $4}'`
+					else
+						BACK="$BACK `echo $MYLINE | awk '{print $3 "=" $4}'`"
+					fi
+				done
+				echo "$REST $BACK" | sed 's!(,!('$TYPE',!' >> $fpref$VFILER
+			else
+				echo "$REST $BACK NOT_Mapped!!" | sed 's!(,!('$TYPE',!' | sed 's/, unmapped//' >> $fpref$VFILER
+			fi
+		done
+
+	done
+	rm lun_show mapped_luns volumes mapped_igroups tmp_* 2> /dev/null
+}
+
+Search ()
+{
+	if [ ! -z $searchfilers ]
+	then
+		#in this case $FILERS must be empty, but in case of -c there are names in it
+		FILERS=""
+		for i in $searchfilers
+		do
+			FILERS="$FILERS$fpref${i} "
+		done
+		num_of_filers=$sf
+		printf "Searching only in${BOLD}${YELLOW_F}$searchfilers$NORM filers.\n"
+	else
+		FILERS=`ls $workfolder/$fpref*` 
+		num_of_filers=`ls $workfolder/$fpref* | wc -l | awk '{print $1}'`
+	fi
+	#num_of_filers=`ls $workfolder/$fpref* | wc -l | awk '{print $1}'`
+	#the search
+	for lunname in $luns
+	do
+		echo "Results for \"${BOLD}${YELLOW_F}$lunname${NORM}\""
+		counter=0
+		for filer in $FILERS
+		do
+	        #looking for the specified lun on the actual filer 
+	        result=`egrep -i "$lunname" $filer`
+	        if [ ! -z "$result" ] ; then
+	            #print out the filer and the found lun in new line
+	            filername=`echo $filer|awk -F_ '{print $2}'`
+				echo "   $filername:"
+				#to make a nice output, we need a loop to include some space characters
+                echo "$result"|while myline=`line`
+					do echo "      $myline"
+				done
+				#the next "if" is to collect all the LUN info for the unmap if -r switch is set
+				if [[ "$remove" == "yes" ]] ; then
+					echo "$result"|while myline=`line`
+					do
+						#I have to use "gawk" here as simple awk cannot use an external variable
+						echo $myline|gawk -v flr="ssh $filername lun unmap" '{
+							if (NF==7){
+								print flr, $1, $6
+								print flr, $1, $7
+							}
+							else
+								if ($5 != "NOT_Mapped!!") {print flr, $1, $6}
+							}'| sed 's/=..*//' >> $parancs
+					done
+				fi
+				echo
+			else
+				#in case no hit, this counter increases
+				#if the counter eq num of filers, that means there was no hit at all
+				(( counter = $counter + 1 ))
+	        fi
+		done
+		if [ $counter -eq $num_of_filers ]
+		then
+			echo "      No hit for \"${BOLD}${MAGENTA_F}$lunname${NORM}\"!"
+			echo
+		fi
+	done
+	#the output of the unmap commands, if any
+	if [ -s $parancs ] ; then
+		echo "${BOLD}The unmap commands for the LUNs that are mapped:${NORM}"
+		cat $parancs|sort -k 2
+		echo
+	fi
+	rm -f $parancs &> /dev/null
+}
+
+CheckDB ()
+{
+	#it happend that there was no data for a filer
+	#this routine check if all exists
+	if [ -z $initiated ]
+	then
+		. $initscript
+		initiated="yes"
+	fi
+	> t_phys_filers
+	#echo $CLUSTERS
+	for i in $CLUSTERS;do 
+		#at this time we have only one vfiler per cluster, but i want to develop this script to be able to handle more
+		#so we need 2 for loops, first cuts the VFILERS in a cluster
+		#the second puts all the VFILERS in temp physical filers file, one vfiler per line
+		VFILERS=`echo $i|awk -F: '{print $2}'` 
+		for j in `echo $VFILERS | sed 's/,/ /g'`;do
+			echo $j >> t_phys_filers
+		done
+	done
+	#test
+	for i in $FILERS $nonprod_filers
+	do
+		echo $i >> t_phys_filers
+	done
+	sort t_phys_filers > phys_filers
+	#check when the db was updated
+	ls $fpref* | sed "s/$fpref//g" | sort > DB_filers
+	FIRST=`ls -l | grep full | awk '{print $6, $7, $8}' | sort -u | head -1`
+	LAST=`ls -l | grep full | awk '{print $6, $7, $8}' | sort -u | tail -1`
+	printf "The DB was last updated between ${BOLD}${YELLOW_F}$FIRST${NORM} and ${BOLD}${YELLOW_F}$LAST${NORM} Geneva local time.\n"
+	#ask the user what to do
+	if [[ `wc -l phys_filers | awk '{print $1}'` != `wc -l DB_filers | awk '{print $1}'` ]]
+	then 
+		MissingFilers=`diff phys_filers DB_filers |grep \<|sed 's/< //'`
+		printf "The following filers are missing from the DB:\n${BOLD}$MissingFilers${NORM}.\n" 
+		printf "Do you want me update to update the whole DB (a), only the missing ones (m) or forget it (f)? "
+		read mf
+		case "$mf" in
+			a)
+				update="yes"
+				UPDFILERS=$FILERS
+			;;
+			m)
+				update="yes"
+				UPDFILERS="$UPDFILERS $MissingFilers"
+			;;
+			f|n|no|N|NO)
+				update="no"
+			;;
+			*)
+				printf "I am sorry, don't understand you, so update the missing ones.\n"
+				update="yes"
+				UPDFILERS=$FILERS
+			;;	
+		esac
+	else
+		printf "All filers has ${BOLD}${YELLOW_F}DB files${NORM}.\n"
+	fi
+	echo
+	rm phys_filers DB_filers
+
+}
+
+VolSearch ()
+{
+	cd $VolumeDir
+	echo "No volume list from the ${BOLD}clusters!$NORM"
+	for volume in $VOLSEARCH;do
+		if [[ $volsearch == "yes" ]] ;then
+			#echo elso
+			egrep -i $volume Full*
+		else
+			#echo else-masodik
+			egrep -i $volume `ls Full* | sort | tail -1`
+		fi
+	done
+}
+
+
+
+#main script part
+
+if [ ! -z $check ]
+then
+	CheckDB
+fi
+
+if [[ "$update" == "yes" ]]
+then
+	Update
+	ClusterUpdate
+	if [[ "$UDSUCCESS" != "no" ]];then
+		echo "Offilne database in ${BOLD}$workfolder${NORM} has been updated successfully!"
+	fi
+	echo
+fi
+
+if [[ "$luns" != "" ]]
+then
+	Search
+#else
+#	echo "${BOLD}No LUN to search!${NORM}"
+fi
+
+
+if [ ! -z $volsearch ] ; then
+	VolSearch
+fi
+
+echo "Successfully ran..."
+
+cd $origfolder
+

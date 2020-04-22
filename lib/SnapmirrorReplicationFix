@@ -1,0 +1,222 @@
+#!/bin/ksh
+#
+#
+if [ $# -eq 1 ] ; then
+	filervol=$1
+else
+	echo "`date '+%d%b%Y_%H:%M:%S'`: Bad parameters - $#"
+	exit 1
+fi
+
+#
+# General variables
+#
+PID=$$
+LOG=/santeam/Logs/SnapmirrorReplicationFix.logs
+MAIL_REC=sanadmin@citco.com
+MAIL_SENDER="SnapmirrorFix-noreply"
+SNAPRESVTRESHOLD=99
+VOLFULLTRESHOLD=90
+#
+# Collect general information
+#
+# Get the DR filer and volume name
+drfiler=`echo $filervol|awk -F: '{print $1}'`
+drvolume=`echo $filervol|awk -F: '{print $2}'`
+# Get the extended status of the replicated volume
+ssh $drfiler snapmirror status -l $drvolume > /tmp/snapmirror_status_${drvolume}
+if [ ! -s /tmp/snapmirror_status_${drvolume} ] ; then
+	echo "`date '+%d%b%Y_%H:%M:%S'`: Can't get the snapmirror status of $drfiler:$drvolume !!" >> $LOG
+	exit 4
+fi
+# Get the status of the replication error
+replication_status=`grep "Transfer Error" /tmp/snapmirror_status_${drvolume}`
+# Get the source filer name
+srcfiler=`grep ^Source /tmp/snapmirror_status_${drvolume}|awk '{print $2}'|awk -F: '{print $1}'`
+# Get the source volume name
+srcvolume=`grep ^Source /tmp/snapmirror_status_${drvolume}|awk '{print $2}'|awk -F: '{print $2}'`
+
+#################
+#  Functions	#
+#################
+
+WriteLogs ()
+{
+ TEXT=$1
+ DATE=`date '+%d%b%Y_%H:%M:%S'`
+ echo "$DATE:$PID:$TEXT" >> $LOG
+}
+
+GrowDRvolume ()
+{
+ srcvolumesize=`ssh $srcfiler vol size $srcvolume|grep "has size"|awk '{print $NF}'|sed -e 's/.$//'`
+ WriteLogs "Source volume size $srcvolume: $srcvolumesize" >> $LOG
+ # Break the replication
+ BREAK_STATUS=0
+ ssh $drfiler snapmirror break $drvolume
+ WriteLogs "ssh $drfiler snapmirror break $drvolume" >> $LOG
+ while [ $BREAK_STATUS -eq 0 ] ; do
+	status=`ssh $drfiler snapmirror status $drvolume|tail -1|awk '{print $3}'`
+	if [ $status = Broken-off ] ; then
+		BREAK_STATUS=1
+	else
+		# wait 3 sec. for completion
+		sleep 3
+	fi
+ done
+ # Update the volume size on the replicated volume
+ WriteLogs "ssh $drfiler vol options $drvolume fs_size_fixed off" >> $LOG
+ ssh $drfiler vol options $drvolume fs_size_fixed off
+ ssh $drfiler vol size $drvolume $srcvolumesize
+ WriteLogs "Increase size on DR volume -> ssh $drfiler vol size $drvolume $srcvolumesize" >> $LOG
+ # Resync snapmirror
+ ssh $drfiler snapmirror resync -f -S ${srcfiler}:${srcvolume} $drvolume
+ WriteLogs "ssh $drfiler snapmirror resync -f ${srcfiler}:${srcvolume} $drvolume" >> $LOG
+}
+
+ShrinkSourceVolume ()
+{
+ # Determine the theoritical size of the source volume
+ # get the lun size in kbytes
+ srclunsize=`ssh $srcfiler df -V $srcvolume|grep -v snap|tail -1|awk '{print $3}'`
+ # Add 10% more for the free space in the volume
+ usedspace=`echo "scale=0;$srclunsize*1.1"|bc`
+ # Remove the decimal part
+ usedspace=`echo $usedspace|sed -e 's/\.[0-9]//'`
+ # Change unit from KB to GB
+ usedspace=`expr $usedspace / 1024 / 1024` # Size in MB,GB
+ # Get the current snap reserve space percentage
+ snapresv=`ssh $srcfiler snap reserve $srcvolume|tail -1|awk '{print $7}'|sed -e 's/%//'`
+ # Calcul of the volume size - unit gb
+ volumesize=`echo "scale=0;($usedspace*100)/(100-$snapresv)"|bc`
+ # Current volume size - we use aggr show_space instead vol size to avoid unit effects (the value is not 100% accurate)
+ currentvolsize=`ssh $srcfiler aggr show_space -g |grep $srcvolume|awk '{print $2}'|sed -e 's/GB//'`
+ WriteLogs "$srcfiler:$srcvolume - current size: ${currentvolsize}GB - new size: ${volumesize}GB" 
+ # Check if the new size is lower than the current size
+ if [ $volumesize -lt $currentvolsize ] ; then
+	 # Apply the new size on the source volume
+	 ssh $srcfiler vol size $srcvolume ${volumesize}g
+	 WriteLogs "Apply the new size to $srcfiler:$srcvolume -> ssh $srcfiler vol size $srcvolume ${volumesize}g"
+	 # Update the DR side
+	 BREAK_STATUS=0
+	 ssh $drfiler snapmirror break $drvolume
+	 WriteLogs "ssh $drfiler snapmirror break $drvolume" >> $LOG
+	 while [ $BREAK_STATUS -eq 0 ] ; do
+		status=`ssh $drfiler snapmirror status $drvolume|tail -1|awk '{print $3}'`
+		if [ $status = Broken-off ] ; then
+			BREAK_STATUS=1
+		else
+			# wait 3 sec. for completion
+			sleep 3
+		fi
+	 done
+	 # Update the volume size on the replicated volume
+	 ssh $drfiler vol options $drvolume fs_size_fixed off
+	 ssh $drfiler vol size $drvolume ${volumesize}g
+	 WriteLogs "Update size on DR volume -> ssh $drfiler vol size $drvolume ${volumesize}g" >> $LOG
+	 # Resync snapmirror
+	 ssh $drfiler snapmirror resync -f -S ${srcfiler}:${srcvolume} $drvolume
+	 WriteLogs "ssh $drfiler snapmirror resync -f ${srcfiler}:${srcvolume} $drvolume" >> $LOG
+ else
+	# The new size is bigger than the current size
+	# because the space used on the volume is >90% or snapshot space consumption is high
+	# in this case we grow the DR volume
+	GrowDRvolume
+ fi
+}
+
+#################
+# MAIN PROGRAM	#
+#################
+
+# Check if the source volume still exist and is online
+ssh $srcfiler vol status $srcvolume|grep online > /dev/null
+if [ $? -ne 0 ] ; then
+	WriteLogs "$srcfiler:$srcvolume doesn't exist or not online"
+	exit 2
+fi
+
+# Check if the source volume has snap reserve configured
+srcvolume_snapres=`ssh $srcfiler snap reserve $srcvolume|tail -1|awk '{print $7}'|sed -e 's/%//'`
+if [ $srcvolume_snapres -eq 0 ] ; then
+	WriteLogs "$srcfiler:$srcvolume doesn't have snap reserve configured"
+	# Send an email to san team
+	echo "Please check, no snapshot reserved space for the replication of volume $rcfiler:$srcvolume" \
+	|mailx -r $MAIL_SENDER -s "Snapmirror replication issue" $MAIL_REC
+	exit 3
+fi
+
+# Check if replication pending because source volume bigger than replicated volume
+echo $replication_status|grep "too small" > /dev/null
+if [ $? -eq 0 ] ; then # Source volume size has increased
+	WriteLogs "Source volume $srcvolume on $srcfiler is bigger than destination"
+	# Check if snap reserved used space on source volume is > 100%
+	snap_perc=`ssh $srcfiler df -Vh $srcvolume|grep snapshot|awk '{print $5}'|sed -e s'/%//'`
+	WriteLogs "snapshot resv used ${snap_perc}% on $srcfiler:$srcvolume"
+	if [ $snap_perc -ge $SNAPRESVTRESHOLD ] ; then # Snapshot usage >= SNAPRESVTRESHOLD
+		# In this case we break the replication and extend the replicated volume
+		GrowDRvolume
+	else
+		# Check the occupation of the volume
+		# if the volume is full at >=90%
+		# we will extend the DR volume
+		srcvolume_occup=`ssh $srcfiler df -Vh $srcvolume|grep -v snap|tail -1|awk '{print $5}'|sed -e 's/%//'`
+		if [ $srcvolume_occup -ge $VOLFULLTRESHOLD ] ; then
+			WriteLogs "Source volume $srcvolume occupation: ${srcvolume_occup}%, the replicated volume will be expanded"
+			GrowDRvolume
+		else
+			# In this case we reduce the size of the source volume
+			ShrinkSourceVolume
+		fi
+	fi
+else
+	# Check if the source filer is still reachable
+	FAILEDPING=0
+	ssh $drfiler 'priv set -q advanced;ping $srcfiler'|grep alive > /dev/null
+	if [ $? -ne 0 ] ; then
+		# Run the test 3 times to confirm
+		ind=0
+		while [ ind -ne 3 ] ; do
+			ssh $drfiler 'priv set -q advanced;ping $srcfiler'|grep alive > /dev/null
+			if [ $? -ne 0 ] ; then
+				FAILEDPING=`expr $FAILEDPING + 1`
+			fi
+			ind=`$ind + 1`
+			sleep 2
+		done
+	fi
+	if [ $FAILEDPING -lt 3 ] ; then # No prob with network or dns
+		# Is the volume size the same between PROD and DR?
+		drvolsize=`ssh $drfiler vol size $drvolume|tail -1|grep "has size"|awk '{print $NF}'|sed -e 's/.$//'`
+		srcvolsize=`ssh $srcfiler vol size $srcvolume|grep "has size"|awk '{print $NF}'|sed -e 's/.$//'`
+		if [ $drvolsize == $srcvolsize ] ; then
+			WriteLogs "$srcfiler:$srcvolume and $drfiler:$drvolume have the same size: $srcvolsize"
+			WriteLogs "We will break snapmirror and resync to force an update"
+			ssh $drfiler snapmirror break $drvolume
+			WriteLogs "ssh $drfiler snapmirror break $drvolume" >> $LOG
+			BREAK_STATUS=0
+			while [ $BREAK_STATUS -eq 0 ] ; do
+				status=`ssh $drfiler snapmirror status $drvolume|tail -1|awk '{print $3}'`
+				if [ $status = Broken-off ] ; then
+					BREAK_STATUS=1
+				else
+					# wait 3 sec. for completion
+					sleep 3
+				fi
+			done
+			# Resync now
+			ssh $drfiler snapmirror resync -f -S ${srcfiler}:${srcvolume} $drvolume
+			WriteLogs "Resync snapmirror relationship, volume size stay unchanged: ssh $drfiler snapmirror resync -f ${srcfiler}:${srcvolume} $drvolume" >> $LOG
+		fi
+	else
+		# Send an alert email to SAN team
+		 WriteLogs "$srcfiler is not reachable from $drfiler"
+		# Send an email to san team
+		echo "Please check for possible network issue, $drfiler can't ping $srcfiler" \
+		|mailx -r $MAIL_SENDER -s "Snapmirror replication issue" $MAIL_REC
+		exit 5
+	fi
+fi
+
+# Delete temp file
+rm /tmp/snapmirror_status_${volume}

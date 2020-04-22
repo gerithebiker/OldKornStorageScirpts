@@ -1,0 +1,98 @@
+#!/bin/ksh
+#
+#
+#author: Geri
+#date:   6/25/2013
+#change list
+#
+#Version 1.01
+#	Added the "options" to be backed up
+#Version 1.02
+#	Added resolv.conf to be backed up
+
+version=1.02
+myname="FilerConfigBackup"
+
+#Variables
+WorkFolder="/santeam/ConfigDB/ConfigFiles"
+initscript="/opt/CITCOSan/Drivers/Driver_init"
+initiated="" #the init script nol loaded yet
+SevenModeFilesToBackup="rc hosts exports snapmirror.conf usermap.cfg resolv.conf"
+HistDir="_PrevVersions"
+
+#colors
+BOLD="\033[1m"
+NORM="\033[0m"
+YELLOW_F="\033[33m"; YELLOW_B="\033[43m"
+RED_F="\033[31m"
+MAGENTA_F="\033[35m"
+CYAN_F="\033[36m"
+BLUE_F="\033[34m"
+
+OrigDir=`pwd`
+cd $WorkFolder
+
+Usage ()
+{
+ echo "Synopsis:"
+ echo "${NORM}   This script creates backups from the filers' configuration files and saves in ${BOLD}$WorkFolder$NORM"
+ echo "   ${BOLD}Version: $version"
+ echo
+ echo "Usage:"
+ echo "   ${BOLD}$myname ${NORM}"
+ echo
+ echo "${BOLD}Examples:${NORM}"
+ echo "   ${BOLD}${BLUE_F}$myname${NORM}"
+ echo "          First rotates the files from $WorkFolder to $WorkFolder/$HistDir,"
+ echo "          and backs up the config files ($SevenModeFilesToBackup) from all the filers"
+ echo "          and stores the output of \"options\"."
+ echo
+}
+
+h=$1
+#check the first parameter or no parameter
+if [[ "$1" == "?" || "$1" == "-h" || "$1" == "-?" || "$1" == "-help" ]]
+then
+	Usage
+	exit
+fi
+
+Backup7modeFilers ()
+{
+	if [ -z $FILERS ];then
+		. $initscipt
+		initiated="yes"
+	fi
+	#FILERS=jrc1sanfiler01 #For testing
+	for filer in $FILERS $nonprod_filers;do
+		echo "Working on ${BOLD}$filer$NORM..."
+		if [ ! -d $WorkFolder/$filer ];then
+			mkdir $WorkFolder/$filer
+		fi
+		cd $WorkFolder/$filer
+
+		for FileToBackup in $SevenModeFilesToBackup;do
+			#log rotation
+			for i in `seq 4 -1 0`;do
+				n=$(($i+1))
+				if [ ! -d $HistDir ];then
+					mkdir $HistDir
+				fi
+				mv $HistDir/$FileToBackup.$i $HistDir/$FileToBackup.$(($i+1)) 2> /dev/null
+				mv $HistDir/OptionsBackup.$i $HistDir/OptionsBackup.$(($i+1)) 2> /dev/null
+			done
+			mv $FileToBackup $HistDir/$FileToBackup.0 2> /dev/null
+			mv OptionsBackup $HistDir/OptionsBackup.0 2> /dev/null
+			ssh -n $filer rdfile /etc/$FileToBackup > $FileToBackup
+			ssh -n $filer options > OptionsBackup
+		done
+	done
+	echo "Update finished..."
+}
+
+
+#main script
+Backup7modeFilers 
+
+cd $OrigDir
+
